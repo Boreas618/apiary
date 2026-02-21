@@ -1,0 +1,617 @@
+//! Sandbox implementation with namespace isolation.
+
+pub mod cgroup;
+pub mod namespace;
+pub mod overlay;
+pub mod seccomp;
+
+use crate::config::{PoolConfig, ResourceLimits, SeccompPolicy};
+use crate::task::{Task, TaskOutputEvent, TaskResult};
+use parking_lot::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+
+/// Errors that can occur during sandbox operations.
+#[derive(Debug, Error)]
+pub enum SandboxError {
+    #[error("failed to create namespace: {0}")]
+    NamespaceCreation(String),
+
+    #[error("failed to setup overlay filesystem: {0}")]
+    OverlaySetup(String),
+
+    #[error("failed to apply seccomp filter: {0}")]
+    SeccompFilter(String),
+
+    #[error("failed to setup cgroup: {0}")]
+    CgroupSetup(String),
+
+    #[error("sandbox is not in idle state")]
+    NotIdle,
+
+    #[error("sandbox execution failed: {0}")]
+    ExecutionFailed(String),
+
+    #[error("sandbox execution timed out")]
+    Timeout,
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("system error: {0}")]
+    System(#[from] nix::Error),
+}
+
+/// State of a sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxState {
+    Creating,
+    Idle,
+    Running { task_id: String },
+    Resetting,
+    Error(String),
+}
+
+/// A single sandbox instance with namespace isolation.
+pub struct Sandbox {
+    id: String,
+    state: Mutex<SandboxState>,
+    root_path: PathBuf,
+    upper_path: PathBuf,
+    work_path: PathBuf,
+    #[allow(dead_code)]
+    init_pid: Mutex<Option<nix::unistd::Pid>>,
+    #[allow(dead_code)]
+    resource_limits: ResourceLimits,
+    #[allow(dead_code)]
+    seccomp_policy: SeccompPolicy,
+    cgroup_path: Option<PathBuf>,
+    stats: SandboxStats,
+}
+
+/// Statistics for a sandbox.
+#[derive(Debug, Default)]
+pub struct SandboxStats {
+    pub tasks_executed: AtomicU64,
+    pub total_execution_time_ms: AtomicU64,
+    pub successful_tasks: AtomicU64,
+    pub failed_tasks: AtomicU64,
+    pub timed_out_tasks: AtomicU64,
+}
+
+impl Sandbox {
+    /// Create a new sandbox.
+    pub fn new(id: String, config: &PoolConfig) -> Result<Self, SandboxError> {
+        let overlay_base = config.overlay_dir.join(&id);
+        let upper_path = overlay_base.join("upper");
+        let work_path = overlay_base.join("work");
+        let root_path = overlay_base.join("merged");
+
+        std::fs::create_dir_all(&upper_path)?;
+        std::fs::create_dir_all(&work_path)?;
+        std::fs::create_dir_all(&root_path)?;
+
+        Ok(Self {
+            id,
+            state: Mutex::new(SandboxState::Creating),
+            root_path,
+            upper_path,
+            work_path,
+            init_pid: Mutex::new(None),
+            resource_limits: config.resource_limits.clone(),
+            seccomp_policy: config.seccomp_policy.clone(),
+            cgroup_path: None,
+            stats: SandboxStats::default(),
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn state(&self) -> SandboxState {
+        self.state.lock().clone()
+    }
+
+    fn set_state(&self, state: SandboxState) {
+        *self.state.lock() = state;
+    }
+
+    pub fn root_path(&self) -> &PathBuf {
+        &self.root_path
+    }
+
+    /// Initialize the sandbox.
+    pub async fn initialize(&mut self, base_image: &PathBuf) -> Result<(), SandboxError> {
+        self.set_state(SandboxState::Creating);
+
+        let base_image = base_image.canonicalize().map_err(|e| {
+            SandboxError::OverlaySetup(format!(
+                "base image not found at {}: {e}",
+                base_image.display()
+            ))
+        })?;
+
+        overlay::setup_overlay(
+            &self.root_path,
+            &self.upper_path,
+            &self.work_path,
+            &base_image,
+        )?;
+
+        match cgroup::setup_cgroup(&self.id, &self.resource_limits) {
+            Ok(path) => {
+                self.cgroup_path = Some(path);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to setup cgroup (may need root or delegation): {e}");
+            }
+        }
+
+        self.set_state(SandboxState::Idle);
+        Ok(())
+    }
+
+    /// Execute a task in this sandbox.
+    pub async fn execute(&self, task: Task) -> Result<TaskResult, SandboxError> {
+        self.execute_with_events(task, None).await
+    }
+
+    /// Execute a task and optionally emit stdout/stderr chunks.
+    pub async fn execute_with_events(
+        &self,
+        task: Task,
+        output_events: Option<mpsc::UnboundedSender<TaskOutputEvent>>,
+    ) -> Result<TaskResult, SandboxError> {
+        {
+            let mut state = self.state.lock();
+            if *state != SandboxState::Idle {
+                return Err(SandboxError::NotIdle);
+            }
+            *state = SandboxState::Running {
+                task_id: task.id.clone(),
+            };
+        }
+
+        let start = Instant::now();
+        let result = self.run_task_inner(&task, output_events).await;
+        let duration = start.elapsed();
+
+        self.stats.tasks_executed.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .total_execution_time_ms
+            .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+
+        match &result {
+            Ok(r) if r.exit_code == 0 => {
+                self.stats.successful_tasks.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(_) => {
+                self.stats.failed_tasks.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(SandboxError::Timeout) => {
+                self.stats.timed_out_tasks.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.stats.failed_tasks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        self.set_state(SandboxState::Idle);
+        result
+    }
+
+    async fn run_task_inner(
+        &self,
+        task: &Task,
+        output_events: Option<mpsc::UnboundedSender<TaskOutputEvent>>,
+    ) -> Result<TaskResult, SandboxError> {
+        use tokio::process::Command;
+        use tokio::time::timeout;
+
+        let shell = task
+            .command
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "/bin/sh".to_string());
+        let args: Vec<&str> = task.command.iter().skip(1).map(|s| s.as_str()).collect();
+
+        let root = self.root_path.clone();
+        let workdir = task.working_dir.clone();
+        let cgroup_path = self.cgroup_path.clone();
+        let seccomp_policy = self.seccomp_policy.clone();
+        let task_uid = task.uid;
+        let task_gid = task.gid;
+
+        let need_stdout_pipe = task.capture_stdout || output_events.is_some();
+        let need_stderr_pipe = task.capture_stderr || output_events.is_some();
+
+        let mut cmd = Command::new(&shell);
+        cmd.args(&args)
+            .env(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            )
+            .env("HOME", "/root")
+            .env("TERM", "xterm-256color")
+            .envs(&task.env)
+            .stdout(if need_stdout_pipe {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stderr(if need_stderr_pipe {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            });
+        if task.stdin.is_some() {
+            cmd.stdin(std::process::Stdio::piped());
+        }
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            cmd.pre_exec(move || {
+                configure_task_process_linux(
+                    &root,
+                    &workdir,
+                    cgroup_path.as_deref(),
+                    &seccomp_policy,
+                    task_uid,
+                    task_gid,
+                )
+            });
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        unsafe {
+            cmd.pre_exec(move || {
+                nix::unistd::chroot(&root)
+                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                let _ = std::fs::create_dir_all(&workdir);
+                std::env::set_current_dir(&workdir)?;
+                Ok(())
+            });
+        }
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| SandboxError::ExecutionFailed(format!("failed to spawn process: {e}")))?;
+
+        let mut child = child;
+        if let Some(pid) = child.id() {
+            *self.init_pid.lock() = Some(nix::unistd::Pid::from_raw(pid as i32));
+        }
+        struct RunningPidGuard<'a> {
+            slot: &'a Mutex<Option<nix::unistd::Pid>>,
+        }
+        impl Drop for RunningPidGuard<'_> {
+            fn drop(&mut self) {
+                *self.slot.lock() = None;
+            }
+        }
+        let _running_pid_guard = RunningPidGuard {
+            slot: &self.init_pid,
+        };
+
+        if let Some(stdin_data) = task.stdin.clone() {
+            if let Some(mut stdin) = child.stdin.take() {
+                tokio::spawn(async move {
+                    let _ = stdin.write_all(&stdin_data).await;
+                    let _ = stdin.shutdown().await;
+                });
+            }
+        }
+
+        let stdout_handle = tokio::spawn(read_output_stream(
+            child.stdout.take(),
+            task.capture_stdout,
+            task.max_output_size,
+            output_events.clone(),
+            TaskOutputEvent::Stdout,
+        ));
+        let stderr_handle = tokio::spawn(read_output_stream(
+            child.stderr.take(),
+            task.capture_stderr,
+            task.max_output_size,
+            output_events.clone(),
+            TaskOutputEvent::Stderr,
+        ));
+
+        let task_start = Instant::now();
+        let wait_result = timeout(task.timeout, child.wait()).await;
+        let task_duration = task_start.elapsed();
+
+        let (exit_code, timed_out) = match wait_result {
+            Ok(Ok(status)) => (status.code().unwrap_or(-1), false),
+            Ok(Err(e)) => return Err(SandboxError::ExecutionFailed(e.to_string())),
+            Err(_) => {
+                if let Some(cgroup_path) = &self.cgroup_path {
+                    let _ = cgroup::kill_cgroup_processes(cgroup_path);
+                }
+                if let Some(pid) = child.id() {
+                    let _ = nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                (-1, true)
+            }
+        };
+
+        let mut stdout = match stdout_handle.await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => return Err(SandboxError::Io(e)),
+            Err(e) => {
+                return Err(SandboxError::ExecutionFailed(format!(
+                    "stdout task join failed: {e}"
+                )));
+            }
+        };
+        let mut stderr = match stderr_handle.await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => return Err(SandboxError::Io(e)),
+            Err(e) => {
+                return Err(SandboxError::ExecutionFailed(format!(
+                    "stderr task join failed: {e}"
+                )));
+            }
+        };
+
+        if timed_out {
+            let timeout_msg = b"Task timed out\n";
+            if task.capture_stderr {
+                append_capped(&mut stderr, timeout_msg, task.max_output_size);
+            }
+            if let Some(tx) = &output_events {
+                let _ = tx.send(TaskOutputEvent::Stderr(timeout_msg.to_vec()));
+            }
+        }
+
+        if !task.capture_stdout {
+            stdout.clear();
+        }
+        if !task.capture_stderr {
+            stderr.clear();
+        }
+
+        Ok(TaskResult {
+            task_id: task.id.clone(),
+            exit_code,
+            stdout,
+            stderr,
+            duration: task_duration,
+            timed_out,
+        })
+    }
+
+    /// Reset the sandbox to a clean state.
+    pub async fn reset(&self) -> Result<(), SandboxError> {
+        self.set_state(SandboxState::Resetting);
+
+        if let Some(pid) = self.init_pid.lock().take() {
+            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        }
+
+        if let Some(ref cgroup_path) = self.cgroup_path {
+            cgroup::kill_cgroup_processes(cgroup_path)?;
+            cgroup::reset_cgroup(cgroup_path)?;
+        }
+
+        if self.upper_path.exists() {
+            overlay::clear_upper_layer(&self.upper_path)?;
+        }
+
+        self.set_state(SandboxState::Idle);
+        Ok(())
+    }
+
+    /// Clean up the sandbox resources.
+    pub fn cleanup(&self) -> Result<(), SandboxError> {
+        if self.root_path.exists() {
+            let _ = overlay::unmount_overlay(&self.root_path);
+        }
+
+        if let Some(ref cgroup_path) = self.cgroup_path {
+            let _ = cgroup::remove_cgroup(cgroup_path);
+        }
+
+        let overlay_base = self.root_path.parent().unwrap_or(&self.root_path);
+        let _ = std::fs::remove_dir_all(overlay_base);
+
+        Ok(())
+    }
+
+    pub fn stats(&self) -> &SandboxStats {
+        &self.stats
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_task_process_linux(
+    root: &Path,
+    workdir: &Path,
+    cgroup_path: Option<&Path>,
+    seccomp_policy: &SeccompPolicy,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> std::io::Result<()> {
+    use nix::mount::{mount, umount2, MntFlags, MsFlags};
+    use nix::sched::{unshare, CloneFlags};
+
+    if unsafe { libc::setpgid(0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut cgroup_status = "disabled";
+    let mut cgroup_reason = String::from("no delegated cgroup available");
+    // Rootless setups may not have delegated write access to cgroup.procs.
+    if let Some(cgroup_path) = cgroup_path {
+        match cgroup::add_process_to_cgroup(cgroup_path, std::process::id()) {
+            Ok(()) => {
+                cgroup_status = "enabled";
+                cgroup_reason = "ok".to_string();
+            }
+            Err(error) => {
+                tracing::warn!(%error, cgroup = %cgroup_path.display(), "Failed to attach process to cgroup");
+                cgroup_reason = error.to_string();
+            }
+        }
+    }
+
+    // Keep mount/IPC/UTS isolation here. PID namespace cannot be entered safely
+    // in pre_exec with std::process::Command due to post-fork constraints.
+    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS)
+        .map_err(|e| std::io::Error::other(format!("failed to unshare task namespaces: {e}")))?;
+    namespace::make_mount_private().map_err(sandbox_error_to_io)?;
+
+    mount(
+        Some(root),
+        root,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(|e| std::io::Error::other(format!("failed to bind mount new root: {e}")))?;
+
+    let put_old = root.join(".old_root");
+    std::fs::create_dir_all(&put_old)?;
+    namespace::pivot_root(root, &put_old).map_err(sandbox_error_to_io)?;
+    umount2("/.old_root", MntFlags::MNT_DETACH)
+        .map_err(|e| std::io::Error::other(format!("failed to unmount old root: {e}")))?;
+    let _ = std::fs::remove_dir_all("/.old_root");
+
+    let mut essential_mounts_status = "enabled";
+    let mut essential_mounts_reason = String::from("ok");
+    // Best-effort in rootless environments where /proc or /dev mounts can be denied.
+    if let Err(error) = overlay::setup_essential_mounts(Path::new("/")) {
+        tracing::warn!(%error, "Failed to mount essential pseudo-filesystems; continuing");
+        essential_mounts_status = "disabled";
+        essential_mounts_reason = error.to_string();
+    }
+
+    let effective_workdir = if workdir.is_absolute() {
+        workdir.to_path_buf()
+    } else {
+        Path::new("/").join(workdir)
+    };
+    std::fs::create_dir_all(&effective_workdir)?;
+    std::env::set_current_dir(&effective_workdir)?;
+
+    if let Some(gid) = gid {
+        if unsafe { libc::setgid(gid) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    if let Some(uid) = uid {
+        if unsafe { libc::setuid(uid) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    let mut seccomp_status = "enabled";
+    let mut seccomp_reason = String::from("ok");
+    // Best-effort seccomp: some kernels/rootless combinations reject filter apply.
+    if let Err(error) = seccomp::set_no_new_privs() {
+        tracing::warn!(%error, "Failed to set no_new_privs; continuing without seccomp");
+        seccomp_status = "disabled";
+        seccomp_reason = format!("set_no_new_privs failed: {error}");
+    } else if let Err(error) = seccomp::apply_seccomp_filter(seccomp_policy) {
+        tracing::warn!(%error, "Failed to apply seccomp filter; continuing");
+        seccomp_status = "disabled";
+        seccomp_reason = error.to_string();
+    }
+
+    tracing::info!(
+        mount_namespace_status = "enabled",
+        ipc_namespace_status = "enabled",
+        uts_namespace_status = "enabled",
+        pid_namespace_status = "disabled",
+        pid_namespace_reason = "unsupported in pre_exec with std::process::Command",
+        cgroup_status,
+        cgroup_reason = %cgroup_reason,
+        essential_mounts_status,
+        essential_mounts_reason = %essential_mounts_reason,
+        seccomp_status,
+        seccomp_reason = %seccomp_reason,
+        "Sandbox feature status"
+    );
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_error_to_io(error: SandboxError) -> std::io::Error {
+    std::io::Error::other(error.to_string())
+}
+
+async fn read_output_stream<R>(
+    reader: Option<R>,
+    capture: bool,
+    max_output_size: usize,
+    output_events: Option<mpsc::UnboundedSender<TaskOutputEvent>>,
+    make_event: fn(Vec<u8>) -> TaskOutputEvent,
+) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return Ok(Vec::new());
+    };
+
+    let mut captured = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+
+        let chunk = &buffer[..read];
+        if let Some(tx) = &output_events {
+            let _ = tx.send(make_event(chunk.to_vec()));
+        }
+
+        if capture && !truncated {
+            let available = max_output_size.saturating_sub(captured.len());
+            if available == 0 {
+                truncated = true;
+                continue;
+            }
+
+            let to_copy = available.min(chunk.len());
+            captured.extend_from_slice(&chunk[..to_copy]);
+            if to_copy < chunk.len() {
+                truncated = true;
+            }
+        }
+    }
+
+    Ok(captured)
+}
+
+fn append_capped(target: &mut Vec<u8>, chunk: &[u8], max_output_size: usize) {
+    let available = max_output_size.saturating_sub(target.len());
+    if available == 0 {
+        return;
+    }
+
+    let to_copy = available.min(chunk.len());
+    target.extend_from_slice(&chunk[..to_copy]);
+}
