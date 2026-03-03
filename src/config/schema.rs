@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::sandbox::overlay::OverlayDriver;
+
 /// Main configuration for the sandbox pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolConfig {
@@ -16,6 +18,10 @@ pub struct PoolConfig {
 
     /// Directory to store overlay layers.
     pub overlay_dir: PathBuf,
+
+    /// Overlay driver to use ("auto", "kernel_overlay", or "fuse_overlayfs").
+    #[serde(default)]
+    pub overlay_driver: OverlayDriver,
 
     /// Resource limits for each sandbox.
     #[serde(default)]
@@ -56,6 +62,7 @@ impl Default for PoolConfig {
             pool_size: 10,
             base_image: PathBuf::from("./rootfs"),
             overlay_dir: PathBuf::from("./overlays"),
+            overlay_driver: OverlayDriver::default(),
             resource_limits: ResourceLimits::default(),
             seccomp_policy: SeccompPolicy::default(),
             network_policy: NetworkPolicy::default(),
@@ -168,6 +175,7 @@ pub struct PoolConfigBuilder {
     pool_size: Option<usize>,
     base_image: Option<PathBuf>,
     overlay_dir: Option<PathBuf>,
+    overlay_driver: Option<OverlayDriver>,
     resource_limits: Option<ResourceLimits>,
     seccomp_policy: Option<SeccompPolicy>,
     network_policy: Option<NetworkPolicy>,
@@ -189,6 +197,11 @@ impl PoolConfigBuilder {
 
     pub fn overlay_dir<P: Into<PathBuf>>(mut self, path: P) -> Self {
         self.overlay_dir = Some(path.into());
+        self
+    }
+
+    pub fn overlay_driver(mut self, driver: OverlayDriver) -> Self {
+        self.overlay_driver = Some(driver);
         self
     }
 
@@ -235,6 +248,7 @@ impl PoolConfigBuilder {
             overlay_dir: self
                 .overlay_dir
                 .unwrap_or_else(super::PoolConfig::default_overlay_dir),
+            overlay_driver: self.overlay_driver.unwrap_or_default(),
             resource_limits: self.resource_limits.unwrap_or_default(),
             seccomp_policy: self.seccomp_policy.unwrap_or_default(),
             network_policy: self.network_policy.unwrap_or_default(),

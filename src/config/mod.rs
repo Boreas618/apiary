@@ -5,6 +5,7 @@ mod schema;
 pub use schema::{
     NetworkPolicy, PoolConfig, PoolConfigBuilder, ResourceLimits, SeccompPolicy,
 };
+pub use crate::sandbox::overlay::OverlayDriver;
 
 use std::path::Path;
 

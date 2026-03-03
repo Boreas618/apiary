@@ -7,6 +7,7 @@ pub mod seccomp;
 
 use crate::config::{PoolConfig, ResourceLimits, SeccompPolicy};
 use crate::task::{Task, TaskOutputEvent, TaskResult};
+use overlay::ActiveOverlay;
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +71,7 @@ pub struct Sandbox {
     #[allow(dead_code)]
     seccomp_policy: SeccompPolicy,
     cgroup_path: Option<PathBuf>,
+    active_overlay: Mutex<Option<ActiveOverlay>>,
     stats: SandboxStats,
 }
 
@@ -105,6 +107,7 @@ impl Sandbox {
             resource_limits: config.resource_limits.clone(),
             seccomp_policy: config.seccomp_policy.clone(),
             cgroup_path: None,
+            active_overlay: Mutex::new(None),
             stats: SandboxStats::default(),
         })
     }
@@ -126,7 +129,11 @@ impl Sandbox {
     }
 
     /// Initialize the sandbox.
-    pub async fn initialize(&mut self, base_image: &PathBuf) -> Result<(), SandboxError> {
+    pub async fn initialize(
+        &mut self,
+        base_image: &PathBuf,
+        driver: &overlay::OverlayDriver,
+    ) -> Result<(), SandboxError> {
         self.set_state(SandboxState::Creating);
 
         let base_image = base_image.canonicalize().map_err(|e| {
@@ -136,12 +143,14 @@ impl Sandbox {
             ))
         })?;
 
-        overlay::setup_overlay(
+        let active = overlay::setup_overlay(
             &self.root_path,
             &self.upper_path,
             &self.work_path,
             &base_image,
+            driver,
         )?;
+        *self.active_overlay.lock() = Some(active);
 
         match cgroup::setup_cgroup(&self.id, &self.resource_limits) {
             Ok(path) => {
@@ -416,8 +425,10 @@ impl Sandbox {
 
     /// Clean up the sandbox resources.
     pub fn cleanup(&self) -> Result<(), SandboxError> {
-        if self.root_path.exists() {
-            let _ = overlay::unmount_overlay(&self.root_path);
+        if let Some(ref active) = *self.active_overlay.lock() {
+            if self.root_path.exists() {
+                let _ = overlay::unmount_overlay(&self.root_path, active);
+            }
         }
 
         if let Some(ref cgroup_path) = self.cgroup_path {
@@ -488,6 +499,16 @@ fn configure_task_process_linux(
     )
     .map_err(|e| std::io::Error::other(format!("failed to bind mount new root: {e}")))?;
 
+    // Phase 1: Setup /dev BEFORE pivot_root so we can bind-mount host
+    // device nodes (avoids mknod which requires CAP_MKNOD).
+    let mut dev_mounts_status = "enabled";
+    let mut dev_mounts_reason = String::from("ok");
+    if let Err(error) = overlay::setup_dev_mounts(root) {
+        tracing::warn!(%error, "Failed to setup /dev; continuing");
+        dev_mounts_status = "disabled";
+        dev_mounts_reason = error.to_string();
+    }
+
     let put_old = root.join(".old_root");
     std::fs::create_dir_all(&put_old)?;
     namespace::pivot_root(root, &put_old).map_err(sandbox_error_to_io)?;
@@ -495,13 +516,14 @@ fn configure_task_process_linux(
         .map_err(|e| std::io::Error::other(format!("failed to unmount old root: {e}")))?;
     let _ = std::fs::remove_dir_all("/.old_root");
 
-    let mut essential_mounts_status = "enabled";
-    let mut essential_mounts_reason = String::from("ok");
-    // Best-effort in rootless environments where /proc or /dev mounts can be denied.
-    if let Err(error) = overlay::setup_essential_mounts(Path::new("/")) {
-        tracing::warn!(%error, "Failed to mount essential pseudo-filesystems; continuing");
-        essential_mounts_status = "disabled";
-        essential_mounts_reason = error.to_string();
+    // Phase 2: Mount pseudo-filesystems (/proc, /sys, /tmp, etc.) AFTER
+    // pivot_root.  Non-critical mounts are best-effort inside the function.
+    let mut pseudo_fs_status = "enabled";
+    let mut pseudo_fs_reason = String::from("ok");
+    if let Err(error) = overlay::setup_post_pivot_mounts(Path::new("/")) {
+        tracing::warn!(%error, "Failed to mount pseudo-filesystems; continuing");
+        pseudo_fs_status = "disabled";
+        pseudo_fs_reason = error.to_string();
     }
 
     let effective_workdir = if workdir.is_absolute() {
@@ -544,8 +566,10 @@ fn configure_task_process_linux(
         pid_namespace_reason = "unsupported in pre_exec with std::process::Command",
         cgroup_status,
         cgroup_reason = %cgroup_reason,
-        essential_mounts_status,
-        essential_mounts_reason = %essential_mounts_reason,
+        dev_mounts_status,
+        dev_mounts_reason = %dev_mounts_reason,
+        pseudo_fs_status,
+        pseudo_fs_reason = %pseudo_fs_reason,
         seccomp_status,
         seccomp_reason = %seccomp_reason,
         "Sandbox feature status"

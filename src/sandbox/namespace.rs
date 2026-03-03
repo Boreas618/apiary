@@ -70,6 +70,20 @@ pub fn original_uid() -> u32 {
     }
 }
 
+/// Returns true if the process entered rootless mode via `enter_rootless_mode()`,
+/// meaning it is running inside a user namespace with a non-root original UID.
+pub fn is_rootless_mode() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let stored = ORIGINAL_UID.load(std::sync::atomic::Ordering::Relaxed);
+        stored != u32::MAX && stored != 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 #[cfg(target_os = "linux")]
 static ORIGINAL_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 

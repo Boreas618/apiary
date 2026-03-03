@@ -146,7 +146,7 @@ impl Pool {
                 .map_err(|e| PoolError::InitFailed(e.to_string()))?;
 
             sandbox
-                .initialize(&self.config.base_image)
+                .initialize(&self.config.base_image, &self.config.overlay_driver)
                 .await
                 .map_err(|e| PoolError::InitFailed(e.to_string()))?;
 
