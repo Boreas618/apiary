@@ -17,7 +17,26 @@ A lightweight sandbox pool for running AI agent tasks on Linux with namespace is
 
 - Linux kernel 5.11+ (for rootless OverlayFS)
 - cgroups v2 with delegation (for rootless resource limits)
+- `uidmap` package (`newuidmap`/`newgidmap`) for helper-based subordinate ID mappings
 - Rust 1.70+
+
+### Rootless namespace prerequisites
+
+`apiary` always needs `CLONE_NEWUSER` support for non-root execution. If your distribution disables it, enable:
+
+```bash
+sudo sysctl -w kernel.unprivileged_userns_clone=1
+```
+
+For helper-based expanded ID maps, configure subordinate ranges and ensure setuid helpers exist:
+
+```bash
+# /etc/subuid
+your-user:100000:65536
+
+# /etc/subgid
+your-user:100000:65536
+```
 
 ### Recommended Distributions
 

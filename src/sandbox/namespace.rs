@@ -93,15 +93,60 @@ mod linux_impl {
     use super::*;
     use nix::sched::{unshare, CloneFlags};
     use nix::sys::wait::waitpid;
-    use nix::unistd::{fork, ForkResult, Gid, Pid, Uid};
+    use nix::unistd::{fork, ForkResult, Gid, Pid, Uid, User};
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
     use std::os::fd::OwnedFd;
     use std::path::Path;
+    use std::process::Command;
+
+    #[derive(Debug, Clone, Copy)]
+    enum IdMapKind {
+        Uid,
+        Gid,
+    }
+
+    impl IdMapKind {
+        fn map_name(self) -> &'static str {
+            match self {
+                Self::Uid => "uid",
+                Self::Gid => "gid",
+            }
+        }
+
+        fn helper_binary(self) -> &'static str {
+            match self {
+                Self::Uid => "newuidmap",
+                Self::Gid => "newgidmap",
+            }
+        }
+
+        fn subid_file(self) -> &'static str {
+            match self {
+                Self::Uid => "/etc/subuid",
+                Self::Gid => "/etc/subgid",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct SubordinateRange {
+        outer_start: u32,
+        count: u32,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct IdMapEntry {
+        inside: u32,
+        outside: u32,
+        count: u32,
+    }
 
     /// Create namespaces for the current process (in-place).
     pub fn create_namespaces(config: &NamespaceConfig) -> Result<(), SandboxError> {
         let mut flags = CloneFlags::empty();
+        let outer_uid = Uid::current().as_raw();
+        let outer_gid = Gid::current().as_raw();
 
         // User namespace must be created first for rootless operation
         if config.user_ns {
@@ -109,8 +154,9 @@ mod linux_impl {
                 SandboxError::NamespaceCreation(format!("failed to create user namespace: {e}"))
             })?;
 
-            setup_uid_map(config.inner_uid)?;
-            setup_gid_map(config.inner_gid)?;
+            let pid = std::process::id();
+            setup_uid_map_for_pid(pid, config.inner_uid, outer_uid)?;
+            setup_gid_map_for_pid(pid, config.inner_gid, outer_gid)?;
         }
 
         if config.mount_ns {
@@ -138,19 +184,208 @@ mod linux_impl {
         Ok(())
     }
 
-    fn setup_uid_map(inner_uid: u32) -> Result<(), SandboxError> {
-        let uid = Uid::current().as_raw();
-        let pid = std::process::id();
-        let map_content = format!("{inner_uid} {uid} 1\n");
-        write_file(&format!("/proc/{pid}/uid_map"), &map_content)
+    fn setup_uid_map_for_pid(pid: u32, inner_uid: u32, outer_uid: u32) -> Result<(), SandboxError> {
+        setup_id_map_for_pid(IdMapKind::Uid, pid, inner_uid, outer_uid)
     }
 
-    fn setup_gid_map(inner_gid: u32) -> Result<(), SandboxError> {
-        let gid = Gid::current().as_raw();
-        let pid = std::process::id();
+    fn setup_gid_map_for_pid(pid: u32, inner_gid: u32, outer_gid: u32) -> Result<(), SandboxError> {
         write_file(&format!("/proc/{pid}/setgroups"), "deny\n")?;
-        let map_content = format!("{inner_gid} {gid} 1\n");
-        write_file(&format!("/proc/{pid}/gid_map"), &map_content)
+        setup_id_map_for_pid(IdMapKind::Gid, pid, inner_gid, outer_gid)
+    }
+
+    fn setup_id_map_for_pid(
+        kind: IdMapKind,
+        pid: u32,
+        inner_id: u32,
+        outer_id: u32,
+    ) -> Result<(), SandboxError> {
+        let mut helper_error = None;
+        match try_setup_id_map_with_helper(kind, pid, inner_id, outer_id) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                helper_error = Some(error);
+            }
+        }
+
+        let direct_map_content = format!("{inner_id} {outer_id} 1\n");
+        let direct_path = format!("/proc/{pid}/{}_map", kind.map_name());
+        if let Err(direct_error) = write_file(&direct_path, &direct_map_content) {
+            if let Some(helper_error) = helper_error {
+                return Err(SandboxError::NamespaceCreation(format!(
+                    "failed to configure {} mapping: helper error: {}; direct write error: {}",
+                    kind.map_name(),
+                    helper_error,
+                    direct_error
+                )));
+            }
+            return Err(direct_error);
+        }
+
+        if let Some(helper_error) = helper_error {
+            tracing::debug!(
+                map = kind.map_name(),
+                %helper_error,
+                "ID-map helper failed; fell back to direct single-ID mapping"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn try_setup_id_map_with_helper(
+        kind: IdMapKind,
+        pid: u32,
+        inner_id: u32,
+        outer_id: u32,
+    ) -> Result<bool, String> {
+        let username = User::from_uid(Uid::from_raw(outer_id))
+            .ok()
+            .flatten()
+            .map(|user| user.name);
+        let ranges = read_subordinate_ranges(kind.subid_file(), username.as_deref(), outer_id)?;
+        if ranges.is_empty() {
+            return Ok(false);
+        }
+
+        let entries = build_helper_map_entries(inner_id, outer_id, &ranges);
+        if entries.len() <= 1 {
+            return Ok(false);
+        }
+
+        run_idmap_helper(kind.helper_binary(), pid, &entries)
+    }
+
+    fn read_subordinate_ranges(
+        path: &str,
+        username: Option<&str>,
+        uid: u32,
+    ) -> Result<Vec<SubordinateRange>, String> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("failed to read {path}: {error}")),
+        };
+        Ok(parse_subordinate_ranges(&content, username, uid))
+    }
+
+    fn parse_subordinate_ranges(
+        content: &str,
+        username: Option<&str>,
+        uid: u32,
+    ) -> Vec<SubordinateRange> {
+        let uid_str = uid.to_string();
+        let mut ranges = Vec::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let mut fields = line.split(':');
+            let Some(owner) = fields.next().map(str::trim) else {
+                continue;
+            };
+            let Some(start_str) = fields.next().map(str::trim) else {
+                continue;
+            };
+            let Some(count_str) = fields.next().map(str::trim) else {
+                continue;
+            };
+            if fields.next().is_some() {
+                continue;
+            }
+
+            let owner_matches = owner == uid_str || username == Some(owner);
+            if !owner_matches {
+                continue;
+            }
+
+            let Ok(start_u64) = start_str.parse::<u64>() else {
+                continue;
+            };
+            let Ok(count_u64) = count_str.parse::<u64>() else {
+                continue;
+            };
+            if count_u64 == 0 {
+                continue;
+            }
+            let Ok(outer_start) = u32::try_from(start_u64) else {
+                continue;
+            };
+            let Ok(count) = u32::try_from(count_u64) else {
+                continue;
+            };
+
+            ranges.push(SubordinateRange { outer_start, count });
+        }
+
+        ranges
+    }
+
+    fn build_helper_map_entries(
+        inner_id: u32,
+        outer_id: u32,
+        ranges: &[SubordinateRange],
+    ) -> Vec<IdMapEntry> {
+        let mut entries = vec![IdMapEntry {
+            inside: inner_id,
+            outside: outer_id,
+            count: 1,
+        }];
+
+        let Some(mut next_inside) = inner_id.checked_add(1) else {
+            return entries;
+        };
+
+        for range in ranges {
+            entries.push(IdMapEntry {
+                inside: next_inside,
+                outside: range.outer_start,
+                count: range.count,
+            });
+
+            let Some(next) = next_inside.checked_add(range.count) else {
+                break;
+            };
+            next_inside = next;
+        }
+
+        entries
+    }
+
+    fn run_idmap_helper(helper: &str, pid: u32, entries: &[IdMapEntry]) -> Result<bool, String> {
+        let mut command = Command::new(helper);
+        command.arg(pid.to_string());
+        for entry in entries {
+            command
+                .arg(entry.inside.to_string())
+                .arg(entry.outside.to_string())
+                .arg(entry.count.to_string());
+        }
+
+        let output = match command.output() {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(format!("failed to launch {helper}: {error}")),
+        };
+
+        if output.status.success() {
+            return Ok(true);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exit status {}", output.status)
+        };
+
+        Err(format!("{helper} failed: {detail}"))
     }
 
     fn write_file(path: &str, content: &str) -> Result<(), SandboxError> {
@@ -276,15 +511,8 @@ mod linux_impl {
             ))
         })?;
 
-        write_file(&format!("/proc/{pid}/setgroups"), "deny\n")?;
-        write_file(
-            &format!("/proc/{pid}/uid_map"),
-            &format!("0 {orig_uid} 1\n"),
-        )?;
-        write_file(
-            &format!("/proc/{pid}/gid_map"),
-            &format!("0 {orig_gid} 1\n"),
-        )?;
+        setup_uid_map_for_pid(pid, 0, orig_uid)?;
+        setup_gid_map_for_pid(pid, 0, orig_gid)?;
 
         unshare(CloneFlags::CLONE_NEWNS).map_err(|e| {
             SandboxError::NamespaceCreation(format!("failed to create mount namespace: {e}"))
@@ -325,6 +553,59 @@ mod linux_impl {
     pub fn set_hostname(hostname: &str) -> Result<(), SandboxError> {
         nix::unistd::sethostname(hostname)
             .map_err(|e| SandboxError::NamespaceCreation(format!("failed to set hostname: {e}")))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_parse_subordinate_ranges_matches_username_and_uid() {
+            let content = r#"
+                alice:100000:65536
+                1000:200000:32768
+                bob:300000:65536
+                alice:not-a-number:100
+                alice:400000:0
+                malformed
+            "#;
+
+            let ranges = parse_subordinate_ranges(content, Some("alice"), 1000);
+            assert_eq!(ranges.len(), 2);
+            assert_eq!(ranges[0].outer_start, 100000);
+            assert_eq!(ranges[0].count, 65536);
+            assert_eq!(ranges[1].outer_start, 200000);
+            assert_eq!(ranges[1].count, 32768);
+        }
+
+        #[test]
+        fn test_build_helper_map_entries_includes_identity_and_subordinate_ranges() {
+            let ranges = vec![
+                SubordinateRange {
+                    outer_start: 100000,
+                    count: 65536,
+                },
+                SubordinateRange {
+                    outer_start: 200000,
+                    count: 65536,
+                },
+            ];
+
+            let entries = build_helper_map_entries(0, 1000, &ranges);
+            assert_eq!(entries.len(), 3);
+
+            assert_eq!(entries[0].inside, 0);
+            assert_eq!(entries[0].outside, 1000);
+            assert_eq!(entries[0].count, 1);
+
+            assert_eq!(entries[1].inside, 1);
+            assert_eq!(entries[1].outside, 100000);
+            assert_eq!(entries[1].count, 65536);
+
+            assert_eq!(entries[2].inside, 65537);
+            assert_eq!(entries[2].outside, 200000);
+            assert_eq!(entries[2].count, 65536);
+        }
     }
 }
 
