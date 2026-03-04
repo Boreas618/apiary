@@ -58,6 +58,21 @@ cargo build --release
 cargo install --path .
 ```
 
+## Dev Container (One-Click)
+
+This repository includes a ready-to-use devcontainer in `.devcontainer/`.
+
+1. Open the project in Cursor or VS Code.
+2. Run **Dev Containers: Reopen in Container**.
+3. Wait for the initial image build and `postCreateCommand` to finish.
+
+The devcontainer is preconfigured for this project's sandbox features:
+
+- Installs `uidmap` (`newuidmap`/`newgidmap`) and `fuse-overlayfs`
+- Sets subordinate ID ranges in `/etc/subuid` and `/etc/subgid`
+- Starts the container with relaxed security options needed for `unshare`
+- Runs `.devcontainer/verify-userns.sh` on startup to print a quick health check
+
 ## Quick Start
 
 ### 1. Create a Base Rootfs
