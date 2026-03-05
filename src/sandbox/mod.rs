@@ -6,7 +6,7 @@ pub mod overlay;
 pub mod seccomp;
 
 use crate::config::{PoolConfig, ResourceLimits, SeccompPolicy};
-use crate::task::{Task, TaskOutputEvent, TaskResult};
+use crate::task::{MountSpec, Task, TaskOutputEvent, TaskResult};
 use overlay::ActiveOverlay;
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -64,11 +64,11 @@ pub struct Sandbox {
     root_path: PathBuf,
     upper_path: PathBuf,
     work_path: PathBuf,
-    #[allow(dead_code)]
     init_pid: Mutex<Option<nix::unistd::Pid>>,
-    #[allow(dead_code)]
     resource_limits: ResourceLimits,
-    #[allow(dead_code)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    enable_seccomp: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     seccomp_policy: SeccompPolicy,
     cgroup_path: Option<PathBuf>,
     active_overlay: Mutex<Option<ActiveOverlay>>,
@@ -105,6 +105,7 @@ impl Sandbox {
             work_path,
             init_pid: Mutex::new(None),
             resource_limits: config.resource_limits.clone(),
+            enable_seccomp: config.enable_seccomp,
             seccomp_policy: config.seccomp_policy.clone(),
             cgroup_path: None,
             active_overlay: Mutex::new(None),
@@ -232,9 +233,12 @@ impl Sandbox {
         let root = self.root_path.clone();
         let workdir = task.working_dir.clone();
         let cgroup_path = self.cgroup_path.clone();
+        let enable_seccomp = self.enable_seccomp;
         let seccomp_policy = self.seccomp_policy.clone();
         let task_uid = task.uid;
         let task_gid = task.gid;
+        let writable_mounts = task.writable_mounts.clone();
+        let readonly_mounts = task.readonly_mounts.clone();
 
         let need_stdout_pipe = task.capture_stdout || output_events.is_some();
         let need_stderr_pipe = task.capture_stderr || output_events.is_some();
@@ -269,9 +273,12 @@ impl Sandbox {
                     &root,
                     &workdir,
                     cgroup_path.as_deref(),
+                    enable_seccomp,
                     &seccomp_policy,
                     task_uid,
                     task_gid,
+                    &writable_mounts,
+                    &readonly_mounts,
                 )
             });
         }
@@ -457,9 +464,12 @@ fn configure_task_process_linux(
     root: &Path,
     workdir: &Path,
     cgroup_path: Option<&Path>,
+    enable_seccomp: bool,
     seccomp_policy: &SeccompPolicy,
     uid: Option<u32>,
     gid: Option<u32>,
+    writable_mounts: &[MountSpec],
+    readonly_mounts: &[MountSpec],
 ) -> std::io::Result<()> {
     use nix::mount::{mount, umount2, MntFlags, MsFlags};
     use nix::sched::{unshare, CloneFlags};
@@ -470,7 +480,6 @@ fn configure_task_process_linux(
 
     let mut cgroup_status = "disabled";
     let mut cgroup_reason = String::from("no delegated cgroup available");
-    // Rootless setups may not have delegated write access to cgroup.procs.
     if let Some(cgroup_path) = cgroup_path {
         match cgroup::add_process_to_cgroup(cgroup_path, std::process::id()) {
             Ok(()) => {
@@ -484,8 +493,6 @@ fn configure_task_process_linux(
         }
     }
 
-    // Keep mount/IPC/UTS isolation here. PID namespace cannot be entered safely
-    // in pre_exec with std::process::Command due to post-fork constraints.
     unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS)
         .map_err(|e| std::io::Error::other(format!("failed to unshare task namespaces: {e}")))?;
     namespace::make_mount_private().map_err(sandbox_error_to_io)?;
@@ -499,8 +506,9 @@ fn configure_task_process_linux(
     )
     .map_err(|e| std::io::Error::other(format!("failed to bind mount new root: {e}")))?;
 
-    // Phase 1: Setup /dev BEFORE pivot_root so we can bind-mount host
-    // device nodes (avoids mknod which requires CAP_MKNOD).
+    // Bind-mount task-specific directories BEFORE pivot_root (host paths still accessible).
+    apply_task_mounts(root, writable_mounts, readonly_mounts)?;
+
     let mut dev_mounts_status = "enabled";
     let mut dev_mounts_reason = String::from("ok");
     if let Err(error) = overlay::setup_dev_mounts(root) {
@@ -516,8 +524,6 @@ fn configure_task_process_linux(
         .map_err(|e| std::io::Error::other(format!("failed to unmount old root: {e}")))?;
     let _ = std::fs::remove_dir_all("/.old_root");
 
-    // Phase 2: Mount pseudo-filesystems (/proc, /sys, /tmp, etc.) AFTER
-    // pivot_root.  Non-critical mounts are best-effort inside the function.
     let mut pseudo_fs_status = "enabled";
     let mut pseudo_fs_reason = String::from("ok");
     if let Err(error) = overlay::setup_post_pivot_mounts(Path::new("/")) {
@@ -545,17 +551,20 @@ fn configure_task_process_linux(
         }
     }
 
-    let mut seccomp_status = "enabled";
-    let mut seccomp_reason = String::from("ok");
-    // Best-effort seccomp: some kernels/rootless combinations reject filter apply.
-    if let Err(error) = seccomp::set_no_new_privs() {
-        tracing::warn!(%error, "Failed to set no_new_privs; continuing without seccomp");
-        seccomp_status = "disabled";
-        seccomp_reason = format!("set_no_new_privs failed: {error}");
-    } else if let Err(error) = seccomp::apply_seccomp_filter(seccomp_policy) {
-        tracing::warn!(%error, "Failed to apply seccomp filter; continuing");
-        seccomp_status = "disabled";
-        seccomp_reason = error.to_string();
+    let mut seccomp_status = "disabled";
+    let mut seccomp_reason = String::from("not enabled");
+    if enable_seccomp {
+        seccomp_status = "enabled";
+        seccomp_reason = "ok".to_string();
+        if let Err(error) = seccomp::set_no_new_privs() {
+            tracing::warn!(%error, "Failed to set no_new_privs; continuing without seccomp");
+            seccomp_status = "disabled";
+            seccomp_reason = format!("set_no_new_privs failed: {error}");
+        } else if let Err(error) = seccomp::apply_seccomp_filter(seccomp_policy) {
+            tracing::warn!(%error, "Failed to apply seccomp filter; continuing");
+            seccomp_status = "disabled";
+            seccomp_reason = error.to_string();
+        }
     }
 
     tracing::info!(
@@ -574,6 +583,80 @@ fn configure_task_process_linux(
         seccomp_reason = %seccomp_reason,
         "Sandbox feature status"
     );
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_task_mounts(
+    root: &Path,
+    writable_mounts: &[MountSpec],
+    readonly_mounts: &[MountSpec],
+) -> std::io::Result<()> {
+    use nix::mount::{mount, MsFlags};
+
+    for spec in writable_mounts {
+        if !spec.source.exists() {
+            return Err(std::io::Error::other(format!(
+                "writable mount source does not exist: {}",
+                spec.source.display()
+            )));
+        }
+        let target = root.join(spec.dest.strip_prefix("/").unwrap_or(&spec.dest));
+        std::fs::create_dir_all(&target)?;
+        mount(
+            Some(&spec.source),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "failed to bind mount {} -> {}: {e}",
+                spec.source.display(),
+                spec.dest.display()
+            ))
+        })?;
+    }
+
+    for spec in readonly_mounts {
+        if !spec.source.exists() {
+            return Err(std::io::Error::other(format!(
+                "readonly mount source does not exist: {}",
+                spec.source.display()
+            )));
+        }
+        let target = root.join(spec.dest.strip_prefix("/").unwrap_or(&spec.dest));
+        std::fs::create_dir_all(&target)?;
+        mount(
+            Some(&spec.source),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "failed to bind mount {} -> {}: {e}",
+                spec.source.display(),
+                spec.dest.display()
+            ))
+        })?;
+        mount(
+            None::<&str>,
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "failed to remount {} as read-only: {e}",
+                spec.dest.display()
+            ))
+        })?;
+    }
 
     Ok(())
 }

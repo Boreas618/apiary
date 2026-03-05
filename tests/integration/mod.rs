@@ -67,6 +67,23 @@ fn test_config_builder() {
 }
 
 #[test]
+fn test_config_builder_rejects_zero_pool_size() {
+    let result = PoolConfig::builder()
+        .pool_size(0)
+        .base_image("/tmp/rootfs")
+        .build();
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_config_builder_requires_base_image() {
+    let result = PoolConfig::builder().pool_size(5).build();
+
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_config_serialization() {
     let config = PoolConfig::builder()
         .pool_size(10)

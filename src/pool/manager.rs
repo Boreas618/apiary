@@ -16,14 +16,17 @@ use crate::config::PoolConfig;
 use crate::sandbox::{Sandbox, SandboxError, SandboxState};
 use crate::task::{Task, TaskOutputEvent, TaskResult};
 
+/// Maximum time a task will wait for an idle sandbox before giving up.
+const SANDBOX_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Errors that can occur during pool operations.
 #[derive(Debug, Error)]
 pub enum PoolError {
     #[error("pool initialization failed: {0}")]
     InitFailed(String),
 
-    #[error("no idle sandbox available")]
-    NoIdleSandbox,
+    #[error("no idle sandbox available (timed out after {0}s)")]
+    NoIdleSandbox(u64),
 
     #[error("sandbox error: {0}")]
     SandboxError(#[from] SandboxError),
@@ -44,25 +47,16 @@ pub enum PoolError {
 /// Status of the pool.
 #[derive(Debug, Clone)]
 pub struct PoolStatus {
-    /// Total number of sandboxes.
     pub total: usize,
-    /// Number of idle sandboxes.
     pub idle: usize,
-    /// Number of busy sandboxes.
     pub busy: usize,
-    /// Number of sandboxes in error state.
     pub error: usize,
-    /// Total tasks executed.
     pub tasks_executed: u64,
-    /// Total tasks completed successfully.
     pub tasks_succeeded: u64,
-    /// Total tasks failed.
     pub tasks_failed: u64,
-    /// Average task duration in milliseconds.
     pub avg_task_duration_ms: u64,
 }
 
-/// Internal task request.
 struct TaskRequest {
     task: Task,
     response: oneshot::Sender<Result<TaskResult, PoolError>>,
@@ -71,27 +65,15 @@ struct TaskRequest {
 
 /// A sandbox pool that manages multiple sandboxes for task execution.
 pub struct Pool {
-    /// Configuration.
     config: Arc<PoolConfig>,
-
-    /// All sandboxes in the pool.
     sandboxes: Arc<RwLock<HashMap<String, Arc<Sandbox>>>>,
-
-    /// Queue of idle sandbox IDs.
     idle_queue: Arc<Mutex<Vec<String>>>,
-
-    /// Notification when a sandbox becomes idle.
     idle_notify: Arc<Notify>,
-
-    /// Task sender channel.
     task_tx: mpsc::Sender<TaskRequest>,
-
-    /// Shutdown flag.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Pool {
-    /// Create a new sandbox pool.
     pub async fn new(config: PoolConfig) -> Result<Self, PoolError> {
         let config = Arc::new(config);
         let sandboxes = Arc::new(RwLock::new(HashMap::new()));
@@ -99,7 +81,6 @@ impl Pool {
         let idle_notify = Arc::new(Notify::new());
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Create task channel
         let (task_tx, task_rx) = mpsc::channel::<TaskRequest>(config.pool_size * 2);
 
         let pool = Self {
@@ -111,22 +92,22 @@ impl Pool {
             shutdown: shutdown.clone(),
         };
 
-        // Initialize sandboxes
         pool.initialize_sandboxes().await?;
 
-        // Start the task dispatcher
-        let dispatcher_sandboxes = sandboxes.clone();
-        let dispatcher_idle_queue = idle_queue.clone();
-        let dispatcher_idle_notify = idle_notify.clone();
-        let dispatcher_shutdown = shutdown.clone();
+        let d_sandboxes = sandboxes.clone();
+        let d_idle_queue = idle_queue.clone();
+        let d_idle_notify = idle_notify.clone();
+        let d_shutdown = shutdown.clone();
+        let d_config = config.clone();
 
         tokio::spawn(async move {
-            Self::task_dispatcher(
+            task_dispatcher(
                 task_rx,
-                dispatcher_sandboxes,
-                dispatcher_idle_queue,
-                dispatcher_idle_notify,
-                dispatcher_shutdown,
+                d_sandboxes,
+                d_idle_queue,
+                d_idle_notify,
+                d_shutdown,
+                d_config,
             )
             .await;
         });
@@ -134,7 +115,6 @@ impl Pool {
         Ok(pool)
     }
 
-    /// Initialize all sandboxes in the pool.
     async fn initialize_sandboxes(&self) -> Result<(), PoolError> {
         tracing::info!("Initializing {} sandboxes...", self.config.pool_size);
 
@@ -160,75 +140,6 @@ impl Pool {
         Ok(())
     }
 
-    /// Task dispatcher loop.
-    async fn task_dispatcher(
-        mut task_rx: mpsc::Receiver<TaskRequest>,
-        sandboxes: Arc<RwLock<HashMap<String, Arc<Sandbox>>>>,
-        idle_queue: Arc<Mutex<Vec<String>>>,
-        idle_notify: Arc<Notify>,
-        shutdown: Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        while let Some(request) = task_rx.recv().await {
-            if shutdown.load(Ordering::Relaxed) {
-                let _ = request.response.send(Err(PoolError::ShuttingDown));
-                continue;
-            }
-
-            // Try to get an idle sandbox
-            let sandbox_id = {
-                let mut queue = idle_queue.lock();
-                queue.pop()
-            };
-
-            let sandbox = match sandbox_id {
-                Some(id) => {
-                    let sandboxes = sandboxes.read();
-                    sandboxes.get(&id).cloned()
-                }
-                None => None,
-            };
-
-            match sandbox {
-                Some(sandbox) => {
-                    let idle_queue = idle_queue.clone();
-                    let idle_notify = idle_notify.clone();
-                    let sandbox_id = sandbox.id().to_string();
-
-                    // Execute task in a separate task
-                    tokio::spawn(async move {
-                        let TaskRequest {
-                            task,
-                            response,
-                            output_events,
-                        } = request;
-                        let result = sandbox.execute_with_events(task, output_events).await;
-
-                        // Reset sandbox and only return healthy sandboxes to idle queue.
-                        match sandbox.reset().await {
-                            Ok(()) => {
-                                idle_queue.lock().push(sandbox_id);
-                                idle_notify.notify_one();
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    %error,
-                                    "sandbox reset failed; sandbox removed from idle pool"
-                                );
-                            }
-                        }
-
-                        // Send result
-                        let _ = response.send(result.map_err(PoolError::SandboxError));
-                    });
-                }
-                None => {
-                    let _ = request.response.send(Err(PoolError::NoIdleSandbox));
-                }
-            }
-        }
-    }
-
-    /// Execute a task in the pool.
     pub async fn execute(&self, task: Task) -> Result<TaskResult, PoolError> {
         if self.shutdown.load(Ordering::Relaxed) {
             return Err(PoolError::ShuttingDown);
@@ -251,7 +162,6 @@ impl Pool {
             .map_err(|_| PoolError::ExecutionFailed("response channel dropped".to_string()))?
     }
 
-    /// Execute a task and emit stdout/stderr chunks while running.
     pub async fn execute_with_events(
         &self,
         task: Task,
@@ -278,13 +188,11 @@ impl Pool {
             .map_err(|_| PoolError::ExecutionFailed("response channel dropped".to_string()))?
     }
 
-    /// Execute multiple tasks in parallel.
     pub async fn execute_batch(&self, tasks: Vec<Task>) -> Vec<Result<TaskResult, PoolError>> {
         let futures: Vec<_> = tasks.into_iter().map(|task| self.execute(task)).collect();
         futures::future::join_all(futures).await
     }
 
-    /// Get the current pool status.
     pub fn status(&self) -> PoolStatus {
         let sandboxes = self.sandboxes.read();
         let idle_count = self.idle_queue.lock().len();
@@ -328,17 +236,15 @@ impl Pool {
         }
     }
 
-    /// Get configuration.
     pub fn config(&self) -> &PoolConfig {
         &self.config
     }
 
-    /// Shutdown the pool gracefully.
     pub async fn shutdown(&self) {
         tracing::info!("Shutting down pool...");
         self.shutdown.store(true, Ordering::Relaxed);
+        self.idle_notify.notify_waiters();
 
-        // Wait for all sandboxes to become idle
         let timeout = Duration::from_secs(30);
         let start = Instant::now();
 
@@ -350,7 +256,6 @@ impl Pool {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // Cleanup all sandboxes
         let sandboxes = self.sandboxes.read();
         for sandbox in sandboxes.values() {
             let _ = sandbox.cleanup();
@@ -359,7 +264,6 @@ impl Pool {
         tracing::info!("Pool shutdown complete");
     }
 
-    /// Wait for an idle sandbox to become available.
     pub async fn wait_for_idle(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
@@ -386,6 +290,162 @@ impl Drop for Pool {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task dispatcher with backpressure and sandbox recovery
+// ---------------------------------------------------------------------------
+
+async fn task_dispatcher(
+    mut task_rx: mpsc::Receiver<TaskRequest>,
+    sandboxes: Arc<RwLock<HashMap<String, Arc<Sandbox>>>>,
+    idle_queue: Arc<Mutex<Vec<String>>>,
+    idle_notify: Arc<Notify>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    config: Arc<PoolConfig>,
+) {
+    while let Some(request) = task_rx.recv().await {
+        if shutdown.load(Ordering::Relaxed) {
+            let _ = request.response.send(Err(PoolError::ShuttingDown));
+            continue;
+        }
+
+        // Spawn each request as its own task so the dispatcher loop
+        // is never blocked; each spawned task waits for an idle sandbox.
+        let sandboxes = sandboxes.clone();
+        let idle_queue = idle_queue.clone();
+        let idle_notify = idle_notify.clone();
+        let shutdown = shutdown.clone();
+        let config = config.clone();
+
+        tokio::spawn(async move {
+            let sandbox = acquire_idle_sandbox(
+                &sandboxes,
+                &idle_queue,
+                &idle_notify,
+                &shutdown,
+            )
+            .await;
+
+            match sandbox {
+                Some(sandbox) => {
+                    let sandbox_id = sandbox.id().to_string();
+                    let TaskRequest {
+                        task,
+                        response,
+                        output_events,
+                    } = request;
+
+                    let result = sandbox.execute_with_events(task, output_events).await;
+
+                    match sandbox.reset().await {
+                        Ok(()) => {
+                            idle_queue.lock().push(sandbox_id);
+                            idle_notify.notify_one();
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                sandbox_id = %sandbox_id,
+                                "sandbox reset failed; replacing"
+                            );
+                            sandboxes.write().remove(&sandbox_id);
+                            drop(sandbox);
+
+                            if let Err(e) = replace_sandbox(
+                                &sandbox_id,
+                                &config,
+                                &sandboxes,
+                                &idle_queue,
+                                &idle_notify,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    %e,
+                                    sandbox_id = %sandbox_id,
+                                    "sandbox replacement failed; pool capacity reduced"
+                                );
+                            }
+                        }
+                    }
+
+                    let _ = response.send(result.map_err(PoolError::SandboxError));
+                }
+                None => {
+                    let err = if shutdown.load(Ordering::Relaxed) {
+                        PoolError::ShuttingDown
+                    } else {
+                        PoolError::NoIdleSandbox(SANDBOX_ACQUIRE_TIMEOUT.as_secs())
+                    };
+                    let _ = request.response.send(Err(err));
+                }
+            }
+        });
+    }
+}
+
+/// Wait for an idle sandbox, blocking up to [`SANDBOX_ACQUIRE_TIMEOUT`].
+async fn acquire_idle_sandbox(
+    sandboxes: &RwLock<HashMap<String, Arc<Sandbox>>>,
+    idle_queue: &Mutex<Vec<String>>,
+    idle_notify: &Notify,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> Option<Arc<Sandbox>> {
+    let deadline = tokio::time::Instant::now() + SANDBOX_ACQUIRE_TIMEOUT;
+
+    loop {
+        if let Some(id) = idle_queue.lock().pop() {
+            if let Some(sb) = sandboxes.read().get(&id).cloned() {
+                return Some(sb);
+            }
+            continue;
+        }
+
+        if shutdown.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let notified = idle_notify.notified();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+
+        match tokio::time::timeout(remaining, notified).await {
+            Ok(()) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Create a replacement sandbox after a failed reset.
+async fn replace_sandbox(
+    sandbox_id: &str,
+    config: &PoolConfig,
+    sandboxes: &RwLock<HashMap<String, Arc<Sandbox>>>,
+    idle_queue: &Mutex<Vec<String>>,
+    idle_notify: &Notify,
+) -> Result<(), PoolError> {
+    tracing::info!(sandbox_id = %sandbox_id, "creating replacement sandbox");
+
+    let mut sandbox = Sandbox::new(sandbox_id.to_string(), config)
+        .map_err(|e| PoolError::InitFailed(format!("replacement creation failed: {e}")))?;
+
+    sandbox
+        .initialize(&config.base_image, &config.overlay_driver)
+        .await
+        .map_err(|e| PoolError::InitFailed(format!("replacement init failed: {e}")))?;
+
+    let sandbox = Arc::new(sandbox);
+    sandboxes
+        .write()
+        .insert(sandbox_id.to_string(), sandbox);
+    idle_queue.lock().push(sandbox_id.to_string());
+    idle_notify.notify_one();
+
+    tracing::info!(sandbox_id = %sandbox_id, "replacement sandbox ready");
+    Ok(())
 }
 
 #[cfg(test)]

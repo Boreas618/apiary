@@ -58,20 +58,26 @@ cargo build --release
 cargo install --path .
 ```
 
-## Dev Container (One-Click)
+## Docker (Recommended)
 
-This repository includes a ready-to-use devcontainer in `.devcontainer/`.
+This repository includes a `Dockerfile` and `docker-compose.yml` at the project root.
 
-1. Open the project in Cursor or VS Code.
-2. Run **Dev Containers: Reopen in Container**.
-3. Wait for the initial image build and `postCreateCommand` to finish.
+```bash
+# Build and start the development container
+docker compose run --rm apiary bash
 
-The devcontainer is preconfigured for this project's sandbox features:
+# Or build and run manually
+docker compose build
+docker compose run --rm apiary cargo build
+```
 
-- Installs `uidmap` (`newuidmap`/`newgidmap`) and `fuse-overlayfs`
+The Docker setup is preconfigured for sandbox features:
+
+- Installs `uidmap` (`newuidmap`/`newgidmap`), `fuse-overlayfs`, and `gosu`
 - Sets subordinate ID ranges in `/etc/subuid` and `/etc/subgid`
-- Starts the container with relaxed security options needed for `unshare`
-- Runs `.devcontainer/verify-userns.sh` on startup to print a quick health check
+- Starts the container with security options needed for `unshare`
+- Entrypoint automatically sets up cgroups v2 delegation before dropping to unprivileged user
+- Run `verify-sandbox.sh` inside the container for a quick health check
 
 ## Quick Start
 

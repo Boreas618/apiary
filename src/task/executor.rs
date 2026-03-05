@@ -30,7 +30,7 @@ pub struct Task {
     pub working_dir: PathBuf,
 
     /// Timeout for the task.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "duration_millis_serde")]
     pub timeout: Duration,
 
     /// Additional directories to mount as writable.
@@ -408,7 +408,7 @@ pub struct TaskResult {
     pub stderr: Vec<u8>,
 
     /// Duration of the execution.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "duration_millis_serde")]
     pub duration: Duration,
 
     /// Whether the task timed out.
@@ -442,7 +442,7 @@ impl TaskResult {
     }
 }
 
-mod humantime_serde {
+mod duration_millis_serde {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 

@@ -15,24 +15,23 @@ pub async fn init_pool(
     pool_size: usize,
     overlay_dir: Option<PathBuf>,
     config_path: Option<PathBuf>,
+    enable_seccomp: bool,
 ) -> anyhow::Result<()> {
     tracing::info!("Initializing sandbox pool...");
 
-    // Validate base image exists
     if !base_image.exists() {
         anyhow::bail!("Base image does not exist: {}", base_image.display());
     }
 
     let overlay_dir = overlay_dir.unwrap_or_else(PoolConfig::default_overlay_dir);
 
-    // Create config
     let config = PoolConfig::builder()
         .pool_size(pool_size)
         .base_image(&base_image)
         .overlay_dir(&overlay_dir)
+        .enable_seccomp(enable_seccomp)
         .build()?;
 
-    // Save config
     let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
     if let Some(parent) = config_file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -41,11 +40,9 @@ pub async fn init_pool(
 
     tracing::info!("Configuration saved to: {}", config_file.display());
 
-    // Create overlay directory
     std::fs::create_dir_all(&overlay_dir)?;
     tracing::info!("Overlay directory: {}", overlay_dir.display());
 
-    // Test pool creation
     tracing::info!("Testing pool initialization...");
     let pool = Pool::new(config).await?;
     let status = pool.status();
@@ -53,6 +50,7 @@ pub async fn init_pool(
     println!("Pool initialized successfully!");
     println!("  Total sandboxes: {}", status.total);
     println!("  Idle sandboxes: {}", status.idle);
+    println!("  Seccomp: {}", if enable_seccomp { "enabled" } else { "disabled" });
     println!("  Config file: {}", config_file.display());
     println!("  Overlay dir: {}", overlay_dir.display());
 
@@ -61,7 +59,12 @@ pub async fn init_pool(
 }
 
 /// Run the daemon.
-pub async fn run_daemon(bind: String, config_path: Option<PathBuf>) -> anyhow::Result<()> {
+pub async fn run_daemon(
+    bind: String,
+    api_token: Option<String>,
+    config_path: Option<PathBuf>,
+    enable_seccomp: bool,
+) -> anyhow::Result<()> {
     let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
 
     if !config_file.exists() {
@@ -71,14 +74,17 @@ pub async fn run_daemon(bind: String, config_path: Option<PathBuf>) -> anyhow::R
         );
     }
 
-    let config = PoolConfig::from_file(&config_file)?;
+    let mut config = PoolConfig::from_file(&config_file)?;
+    if enable_seccomp {
+        config.enable_seccomp = true;
+    }
     tracing::info!("Loaded config from: {}", config_file.display());
 
     let pool = Arc::new(Pool::new(config).await?);
     tracing::info!("Pool initialized with {} sandboxes", pool.status().total);
     tracing::info!("Starting daemon API server (bind address: {bind})");
 
-    let server_result = server::run_server(bind, pool.clone()).await;
+    let server_result = server::run_server(bind, pool.clone(), api_token).await;
     tracing::info!("Shutting down...");
     pool.shutdown().await;
     server_result?;
@@ -93,6 +99,7 @@ pub async fn run_task(
     workdir: Option<PathBuf>,
     env: Vec<String>,
     config_path: Option<PathBuf>,
+    enable_seccomp: bool,
 ) -> anyhow::Result<()> {
     let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
 
@@ -103,10 +110,12 @@ pub async fn run_task(
         );
     }
 
-    let config = PoolConfig::from_file(&config_file)?;
+    let mut config = PoolConfig::from_file(&config_file)?;
+    if enable_seccomp {
+        config.enable_seccomp = true;
+    }
     let pool = Pool::new(config.clone()).await?;
 
-    // Parse environment variables
     let env_map: HashMap<String, String> = env
         .iter()
         .filter_map(|s| {
@@ -119,7 +128,6 @@ pub async fn run_task(
         })
         .collect();
 
-    // Create task
     let mut task = Task::new(&command)
         .timeout(Duration::from_secs(timeout))
         .envs(env_map);
@@ -132,10 +140,8 @@ pub async fn run_task(
 
     tracing::info!("Executing: {command}");
 
-    // Execute
     let result = pool.execute(task).await?;
 
-    // Print output
     if !result.stdout.is_empty() {
         print!("{}", result.stdout_lossy());
     }
@@ -155,9 +161,14 @@ pub async fn run_task(
         println!("Status: FAILED");
     }
 
+    let exit_code = result.exit_code;
     pool.shutdown().await;
 
-    std::process::exit(result.exit_code);
+    if exit_code != 0 {
+        anyhow::bail!("task exited with code {exit_code}");
+    }
+
+    Ok(())
 }
 
 /// Run multiple tasks from a JSON file.
@@ -165,6 +176,7 @@ pub async fn run_batch(
     tasks_file: PathBuf,
     parallelism: usize,
     config_path: Option<PathBuf>,
+    enable_seccomp: bool,
 ) -> anyhow::Result<()> {
     let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
 
@@ -179,9 +191,11 @@ pub async fn run_batch(
         anyhow::bail!("Tasks file not found: {}", tasks_file.display());
     }
 
-    let config = PoolConfig::from_file(&config_file)?;
+    let mut config = PoolConfig::from_file(&config_file)?;
+    if enable_seccomp {
+        config.enable_seccomp = true;
+    }
 
-    // Adjust pool size for parallelism
     let config = PoolConfig {
         pool_size: parallelism.min(config.pool_size),
         ..config
@@ -189,19 +203,16 @@ pub async fn run_batch(
 
     let pool = Pool::new(config).await?;
 
-    // Load tasks
     let tasks_content = std::fs::read_to_string(&tasks_file)?;
     let tasks: Vec<Task> = serde_json::from_str(&tasks_content)?;
 
     tracing::info!("Loaded {} tasks from {}", tasks.len(), tasks_file.display());
     tracing::info!("Running with parallelism: {parallelism}");
 
-    // Execute batch
     let start = std::time::Instant::now();
     let results = pool.execute_batch(tasks).await;
     let duration = start.elapsed();
 
-    // Print summary
     let mut succeeded = 0;
     let mut failed = 0;
     let mut timed_out = 0;
@@ -242,13 +253,13 @@ pub async fn run_batch(
     pool.shutdown().await;
 
     if failed > 0 || timed_out > 0 {
-        std::process::exit(1);
+        anyhow::bail!("{failed} task(s) failed, {timed_out} timed out");
     }
 
     Ok(())
 }
 
-/// Show pool status.
+/// Show pool configuration (reads config without creating a pool).
 pub async fn show_status(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
 
@@ -260,26 +271,57 @@ pub async fn show_status(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     }
 
     let config = PoolConfig::from_file(&config_file)?;
-    let pool = Pool::new(config).await?;
-    let status = pool.status();
 
-    println!("=== Sandbox Pool Status ===");
-    println!("Total sandboxes: {}", status.total);
-    println!("Idle: {}", status.idle);
-    println!("Busy: {}", status.busy);
-    println!("Error: {}", status.error);
+    println!("=== Sandbox Pool Configuration ===");
+    println!("Config file: {}", config_file.display());
+    println!("Pool size: {}", config.pool_size);
+    println!("Base image: {}", config.base_image.display());
+    println!("Overlay dir: {}", config.overlay_dir.display());
+    println!("Overlay driver: {:?}", config.overlay_driver);
+    println!("Default timeout: {:?}", config.default_timeout);
+    println!("Default workdir: {}", config.default_workdir.display());
+    println!(
+        "Seccomp: {}",
+        if config.enable_seccomp {
+            "enabled"
+        } else {
+            "disabled (use --seccomp to enable)"
+        }
+    );
     println!();
-    println!("=== Statistics ===");
-    println!("Tasks executed: {}", status.tasks_executed);
-    println!("Succeeded: {}", status.tasks_succeeded);
-    println!("Failed: {}", status.tasks_failed);
-    if status.tasks_executed > 0 {
-        println!("Success rate: {:.1}%", 
-            status.tasks_succeeded as f64 / status.tasks_executed as f64 * 100.0);
-        println!("Avg duration: {}ms", status.avg_task_duration_ms);
+    println!("=== Resource Limits ===");
+    println!("Memory max: {}", config.resource_limits.memory_max);
+    println!("CPU max: {}", config.resource_limits.cpu_max);
+    println!("PIDs max: {}", config.resource_limits.pids_max);
+    if let Some(ref io_max) = config.resource_limits.io_max {
+        println!("I/O max: {io_max}");
     }
 
-    pool.shutdown().await;
+    if config.enable_seccomp {
+        println!();
+        println!("=== Seccomp Policy ===");
+        println!("Block network: {}", config.seccomp_policy.block_network);
+        println!(
+            "Allow UNIX sockets: {}",
+            config.seccomp_policy.allow_unix_sockets
+        );
+        if !config.seccomp_policy.blocked_syscalls.is_empty() {
+            println!(
+                "Additional blocked: {}",
+                config.seccomp_policy.blocked_syscalls.join(", ")
+            );
+        }
+        if !config.seccomp_policy.allowed_syscalls.is_empty() {
+            println!(
+                "Explicitly allowed: {}",
+                config.seccomp_policy.allowed_syscalls.join(", ")
+            );
+        }
+    }
+
+    println!();
+    println!("For live pool status, query the daemon API: GET /api/v1/status");
+
     Ok(())
 }
 
@@ -303,39 +345,16 @@ pub async fn cleanup(force: bool, config_path: Option<PathBuf>) -> anyhow::Resul
         return Ok(());
     }
 
-    // Remove overlay directory
     if config.overlay_dir.exists() {
         tracing::info!("Removing overlay directory: {}", config.overlay_dir.display());
         std::fs::remove_dir_all(&config.overlay_dir)?;
     }
 
-    // Remove config file
     if config_file.exists() {
         tracing::info!("Removing config file: {}", config_file.display());
         std::fs::remove_file(&config_file)?;
     }
 
     println!("Cleanup complete.");
-    Ok(())
-}
-
-/// Create a sample tasks JSON file.
-#[allow(dead_code)]
-pub fn create_sample_tasks_file(path: &PathBuf) -> anyhow::Result<()> {
-    let tasks = vec![
-        Task::new("echo 'Hello from task 1'"),
-        Task::new("echo 'Hello from task 2'"),
-        Task::new("ls -la /"),
-        Task::builder()
-            .command("python3 -c 'print(2 + 2)'")
-            .timeout_secs(30)
-            .build()
-            .unwrap(),
-    ];
-
-    let json = serde_json::to_string_pretty(&tasks)?;
-    std::fs::write(path, json)?;
-
-    println!("Sample tasks file created: {}", path.display());
     Ok(())
 }

@@ -51,10 +51,15 @@ fn build_filter(policy: &SeccompPolicy) -> Result<SeccompFilter, SandboxError> {
         add_network_blocking_rules(&mut rules, policy.allow_unix_sockets)?;
     }
 
-    // Add any additional blocked syscalls
     for syscall_name in &policy.blocked_syscalls {
         if let Some(nr) = syscall_number(syscall_name) {
-            rules.insert(nr, vec![]); // Empty vec = unconditional block
+            rules.insert(nr, vec![]);
+        }
+    }
+
+    for syscall_name in &policy.allowed_syscalls {
+        if let Some(nr) = syscall_number(syscall_name) {
+            rules.remove(&nr);
         }
     }
 
@@ -75,7 +80,6 @@ fn add_network_blocking_rules(
     rules: &mut BTreeMap<i64, Vec<SeccompRule>>,
     allow_unix_sockets: bool,
 ) -> Result<(), SandboxError> {
-    // Syscalls to block unconditionally
     let blocked_syscalls = [
         libc::SYS_connect,
         libc::SYS_accept,
@@ -86,7 +90,10 @@ fn add_network_blocking_rules(
         libc::SYS_getsockname,
         libc::SYS_shutdown,
         libc::SYS_sendto,
+        libc::SYS_sendmsg,
         libc::SYS_sendmmsg,
+        libc::SYS_recvfrom,
+        libc::SYS_recvmsg,
         libc::SYS_recvmmsg,
         libc::SYS_getsockopt,
         libc::SYS_setsockopt,

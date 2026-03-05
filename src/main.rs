@@ -17,6 +17,10 @@ struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 
+    /// Enable seccomp syscall filtering inside sandboxes
+    #[arg(long, global = true)]
+    seccomp: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -43,6 +47,10 @@ enum Commands {
         /// Bind address for the API server
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: String,
+
+        /// Bearer token for API authentication (also reads APIARY_API_TOKEN env)
+        #[arg(long, env = "APIARY_API_TOKEN")]
+        api_token: Option<String>,
     },
 
     /// Run a single command in a sandbox
@@ -75,7 +83,7 @@ enum Commands {
         parallelism: usize,
     },
 
-    /// Show pool status
+    /// Show pool configuration and status
     Status,
 
     /// Clean up sandbox pool resources
@@ -100,8 +108,6 @@ fn setup_logging(verbose: u8) {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Must run before tokio (before any threads are spawned),
-    // because unshare(CLONE_NEWUSER) requires a single-threaded process.
     apiary::sandbox::namespace::enter_rootless_mode()?;
 
     tokio::runtime::Runtime::new()?.block_on(async_main())
@@ -111,16 +117,18 @@ async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     setup_logging(cli.verbose);
 
+    let seccomp = cli.seccomp;
+
     match cli.command {
         Commands::Init {
             base_image,
             pool_size,
             overlay_dir,
         } => {
-            api::cli::init_pool(base_image, pool_size, overlay_dir, cli.config).await?;
+            api::cli::init_pool(base_image, pool_size, overlay_dir, cli.config, seccomp).await?;
         }
-        Commands::Daemon { bind } => {
-            api::cli::run_daemon(bind, cli.config).await?;
+        Commands::Daemon { bind, api_token } => {
+            api::cli::run_daemon(bind, api_token, cli.config, seccomp).await?;
         }
         Commands::Run {
             command,
@@ -128,10 +136,10 @@ async fn async_main() -> anyhow::Result<()> {
             workdir,
             env,
         } => {
-            api::cli::run_task(command, timeout, workdir, env, cli.config).await?;
+            api::cli::run_task(command, timeout, workdir, env, cli.config, seccomp).await?;
         }
         Commands::Batch { tasks, parallelism } => {
-            api::cli::run_batch(tasks, parallelism, cli.config).await?;
+            api::cli::run_batch(tasks, parallelism, cli.config, seccomp).await?;
         }
         Commands::Status => {
             api::cli::show_status(cli.config).await?;

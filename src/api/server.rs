@@ -9,6 +9,7 @@ use std::time::Duration;
 use async_stream::stream;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -21,6 +22,7 @@ use apiary::{Pool, PoolError, Task, TaskOutputEvent};
 #[derive(Clone)]
 struct AppState {
     pool: Arc<Pool>,
+    api_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,12 +92,29 @@ struct StreamDoneEvent {
     success: bool,
 }
 
-pub async fn run_server(bind: String, pool: Arc<Pool>) -> anyhow::Result<()> {
-    let app = Router::new()
-        .route("/healthz", get(healthz))
+pub async fn run_server(
+    bind: String,
+    pool: Arc<Pool>,
+    api_token: Option<String>,
+) -> anyhow::Result<()> {
+    let state = AppState {
+        pool,
+        api_token: api_token.clone(),
+    };
+
+    let api_routes = Router::new()
         .route("/api/v1/status", get(status))
         .route("/api/v1/tasks", post(execute_task))
-        .with_state(AppState { pool });
+        .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
+
+    let app = Router::new()
+        .route("/healthz", get(healthz))
+        .merge(api_routes)
+        .with_state(state);
+
+    if api_token.is_some() {
+        tracing::info!("API authentication enabled (Bearer token required)");
+    }
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     let local_addr = listener.local_addr()?;
@@ -106,6 +125,34 @@ pub async fn run_server(bind: String, pool: Arc<Pool>) -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+async fn auth_layer(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Result<Response, StatusCode> {
+    if let Some(ref expected) = state.api_token {
+        let auth = request
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "));
+
+        match auth {
+            Some(token) if token == expected.as_str() => {}
+            _ => {
+                return Ok((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: "invalid or missing Bearer token".to_string(),
+                    }),
+                )
+                    .into_response())
+            }
+        }
+    }
+    Ok(next.run(request).await)
 }
 
 async fn shutdown_signal() {
@@ -312,9 +359,9 @@ impl ApiError {
 
     fn from_pool_error(error: PoolError) -> Self {
         match error {
-            PoolError::NoIdleSandbox => Self {
+            PoolError::NoIdleSandbox(_) => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "no idle sandbox available".to_string(),
+                message: error.to_string(),
             },
             PoolError::ShuttingDown => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,

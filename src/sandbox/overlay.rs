@@ -20,7 +20,7 @@
 //!   reliably in rootless mode on virtually all distributions. Requires
 //!   `fuse-overlayfs` to be installed.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -47,42 +47,6 @@ pub enum ActiveOverlay {
     FuseOverlayfs,
     /// Non-Linux stub (no real mount).
     Stub,
-}
-
-/// OverlayFS mount configuration.
-#[derive(Debug, Clone)]
-pub struct OverlayConfig {
-    /// Path to the lower (read-only) layer.
-    pub lower: PathBuf,
-    /// Path to the upper (writable) layer.
-    pub upper: PathBuf,
-    /// Path to the work directory.
-    pub work: PathBuf,
-    /// Path to the merged mount point.
-    pub merged: PathBuf,
-}
-
-impl OverlayConfig {
-    /// Create a new OverlayConfig for a sandbox.
-    pub fn new(sandbox_id: &str, base_image: &Path, overlay_base: &Path) -> Self {
-        let sandbox_dir = overlay_base.join(sandbox_id);
-        Self {
-            lower: base_image.to_path_buf(),
-            upper: sandbox_dir.join("upper"),
-            work: sandbox_dir.join("work"),
-            merged: sandbox_dir.join("merged"),
-        }
-    }
-
-    /// Get the options string for the mount command.
-    pub fn mount_options(&self) -> String {
-        format!(
-            "lowerdir={},upperdir={},workdir={}",
-            self.lower.display(),
-            self.upper.display(),
-            self.work.display()
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -570,36 +534,6 @@ pub fn get_upper_layer_size(upper: &Path) -> Result<u64, SandboxError> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    #[test]
-    fn test_overlay_config() {
-        let base = PathBuf::from("/base");
-        let overlay_base = PathBuf::from("/overlays");
-        let config = OverlayConfig::new("test-sandbox", &base, &overlay_base);
-
-        assert_eq!(config.lower, base);
-        assert_eq!(config.upper, PathBuf::from("/overlays/test-sandbox/upper"));
-        assert_eq!(config.work, PathBuf::from("/overlays/test-sandbox/work"));
-        assert_eq!(
-            config.merged,
-            PathBuf::from("/overlays/test-sandbox/merged")
-        );
-    }
-
-    #[test]
-    fn test_mount_options() {
-        let config = OverlayConfig {
-            lower: PathBuf::from("/lower"),
-            upper: PathBuf::from("/upper"),
-            work: PathBuf::from("/work"),
-            merged: PathBuf::from("/merged"),
-        };
-
-        let options = config.mount_options();
-        assert!(options.contains("lowerdir=/lower"));
-        assert!(options.contains("upperdir=/upper"));
-        assert!(options.contains("workdir=/work"));
-    }
 
     #[test]
     fn test_clear_upper_layer() {

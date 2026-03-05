@@ -1,0 +1,20 @@
+services:
+  apiary:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    security_opt:
+      - seccomp=unconfined
+      - label=disable
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    cgroup: private
+    tmpfs:
+      - /sys/fs/cgroup:rw,mode=755
+    environment:
+      RUST_BACKTRACE: "1"
+    volumes:
+      - .:/workspace
+    working_dir: /workspace

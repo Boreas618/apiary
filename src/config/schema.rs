@@ -27,16 +27,16 @@ pub struct PoolConfig {
     #[serde(default)]
     pub resource_limits: ResourceLimits,
 
-    /// seccomp policy configuration.
+    /// Whether seccomp filtering is enabled. Off by default; enable with --seccomp.
+    #[serde(default)]
+    pub enable_seccomp: bool,
+
+    /// seccomp policy configuration (only applies when enable_seccomp is true).
     #[serde(default)]
     pub seccomp_policy: SeccompPolicy,
 
-    /// Network policy.
-    #[serde(default)]
-    pub network_policy: NetworkPolicy,
-
     /// Default timeout for tasks.
-    #[serde(default = "default_timeout", with = "humantime_serde")]
+    #[serde(default = "default_timeout", with = "duration_string_serde")]
     pub default_timeout: Duration,
 
     /// Default working directory inside sandbox.
@@ -64,8 +64,8 @@ impl Default for PoolConfig {
             overlay_dir: PathBuf::from("./overlays"),
             overlay_driver: OverlayDriver::default(),
             resource_limits: ResourceLimits::default(),
+            enable_seccomp: false,
             seccomp_policy: SeccompPolicy::default(),
-            network_policy: NetworkPolicy::default(),
             default_timeout: default_timeout(),
             default_workdir: default_workdir(),
             default_env: HashMap::new(),
@@ -155,20 +155,6 @@ impl Default for SeccompPolicy {
     }
 }
 
-/// Network policy configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub enum NetworkPolicy {
-    /// No network access (most secure).
-    #[default]
-    None,
-
-    /// Shared host network with seccomp filtering.
-    SharedHost,
-
-    /// Isolated network namespace (more complex setup).
-    Isolated,
-}
-
 /// Builder for PoolConfig.
 #[derive(Debug, Default)]
 pub struct PoolConfigBuilder {
@@ -177,8 +163,8 @@ pub struct PoolConfigBuilder {
     overlay_dir: Option<PathBuf>,
     overlay_driver: Option<OverlayDriver>,
     resource_limits: Option<ResourceLimits>,
+    enable_seccomp: Option<bool>,
     seccomp_policy: Option<SeccompPolicy>,
-    network_policy: Option<NetworkPolicy>,
     default_timeout: Option<Duration>,
     default_workdir: Option<PathBuf>,
     default_env: Option<HashMap<String, String>>,
@@ -210,13 +196,13 @@ impl PoolConfigBuilder {
         self
     }
 
-    pub fn seccomp_policy(mut self, policy: SeccompPolicy) -> Self {
-        self.seccomp_policy = Some(policy);
+    pub fn enable_seccomp(mut self, enabled: bool) -> Self {
+        self.enable_seccomp = Some(enabled);
         self
     }
 
-    pub fn network_policy(mut self, policy: NetworkPolicy) -> Self {
-        self.network_policy = Some(policy);
+    pub fn seccomp_policy(mut self, policy: SeccompPolicy) -> Self {
+        self.seccomp_policy = Some(policy);
         self
     }
 
@@ -242,16 +228,21 @@ impl PoolConfigBuilder {
             .base_image
             .ok_or_else(|| anyhow::anyhow!("base_image is required"))?;
 
+        let pool_size = self.pool_size.unwrap_or(10);
+        if pool_size == 0 {
+            anyhow::bail!("pool_size must be at least 1");
+        }
+
         Ok(PoolConfig {
-            pool_size: self.pool_size.unwrap_or(10),
+            pool_size,
             base_image,
             overlay_dir: self
                 .overlay_dir
                 .unwrap_or_else(super::PoolConfig::default_overlay_dir),
             overlay_driver: self.overlay_driver.unwrap_or_default(),
             resource_limits: self.resource_limits.unwrap_or_default(),
+            enable_seccomp: self.enable_seccomp.unwrap_or(false),
             seccomp_policy: self.seccomp_policy.unwrap_or_default(),
-            network_policy: self.network_policy.unwrap_or_default(),
             default_timeout: self.default_timeout.unwrap_or_else(default_timeout),
             default_workdir: self.default_workdir.unwrap_or_else(default_workdir),
             default_env: self.default_env.unwrap_or_default(),
@@ -259,7 +250,7 @@ impl PoolConfigBuilder {
     }
 }
 
-mod humantime_serde {
+mod duration_string_serde {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 

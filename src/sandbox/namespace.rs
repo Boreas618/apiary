@@ -44,15 +44,6 @@ impl Default for NamespaceConfig {
     }
 }
 
-/// File descriptors for namespaces.
-#[derive(Debug, Default)]
-pub struct NamespaceFds {
-    pub user_ns: Option<std::os::fd::OwnedFd>,
-    pub mount_ns: Option<std::os::fd::OwnedFd>,
-    pub pid_ns: Option<std::os::fd::OwnedFd>,
-    pub net_ns: Option<std::os::fd::OwnedFd>,
-}
-
 /// Returns the real UID from before entering the user namespace.
 /// Falls back to `Uid::current()` if rootless mode was never entered.
 pub fn original_uid() -> u32 {
@@ -92,11 +83,9 @@ static ORIGINAL_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 mod linux_impl {
     use super::*;
     use nix::sched::{unshare, CloneFlags};
-    use nix::sys::wait::waitpid;
-    use nix::unistd::{fork, ForkResult, Gid, Pid, Uid, User};
-    use std::fs::{File, OpenOptions};
-    use std::io::{Read, Write};
-    use std::os::fd::OwnedFd;
+    use nix::unistd::{Gid, Uid, User};
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use std::path::Path;
     use std::process::Command;
 
@@ -397,97 +386,6 @@ mod linux_impl {
             .map_err(|e| SandboxError::NamespaceCreation(format!("failed to write to {path}: {e}")))
     }
 
-    /// Enter existing namespaces by file descriptors.
-    pub fn enter_namespaces(ns_fds: &NamespaceFds) -> Result<(), SandboxError> {
-        use nix::sched::setns;
-
-        if let Some(fd) = &ns_fds.user_ns {
-            setns(fd, CloneFlags::CLONE_NEWUSER).map_err(|e| {
-                SandboxError::NamespaceCreation(format!("failed to enter user namespace: {e}"))
-            })?;
-        }
-        if let Some(fd) = &ns_fds.mount_ns {
-            setns(fd, CloneFlags::CLONE_NEWNS).map_err(|e| {
-                SandboxError::NamespaceCreation(format!("failed to enter mount namespace: {e}"))
-            })?;
-        }
-        if let Some(fd) = &ns_fds.pid_ns {
-            setns(fd, CloneFlags::CLONE_NEWPID).map_err(|e| {
-                SandboxError::NamespaceCreation(format!("failed to enter PID namespace: {e}"))
-            })?;
-        }
-        if let Some(fd) = &ns_fds.net_ns {
-            setns(fd, CloneFlags::CLONE_NEWNET).map_err(|e| {
-                SandboxError::NamespaceCreation(format!("failed to enter network namespace: {e}"))
-            })?;
-        }
-        Ok(())
-    }
-
-    impl NamespaceFds {
-        pub fn from_pid(pid: Pid) -> Result<Self, SandboxError> {
-            let ns_dir = format!("/proc/{}/ns", pid.as_raw());
-            let open_ns = |name: &str| -> Option<OwnedFd> {
-                let path = format!("{ns_dir}/{name}");
-                File::open(&path).ok().map(Into::into)
-            };
-            Ok(Self {
-                user_ns: open_ns("user"),
-                mount_ns: open_ns("mnt"),
-                pid_ns: open_ns("pid"),
-                net_ns: open_ns("net"),
-            })
-        }
-    }
-
-    /// Fork and execute a function in a new set of namespaces.
-    pub fn fork_with_namespaces<F>(
-        config: &NamespaceConfig,
-        child_fn: F,
-    ) -> Result<Pid, SandboxError>
-    where
-        F: FnOnce() -> i32,
-    {
-        let (read_fd, write_fd) = nix::unistd::pipe()
-            .map_err(|e| SandboxError::NamespaceCreation(format!("failed to create pipe: {e}")))?;
-
-        match unsafe { fork() } {
-            Ok(ForkResult::Parent { child }) => {
-                drop(write_fd);
-                let mut buf = [0u8; 1];
-                let mut read_file = File::from(read_fd);
-                match read_file.read_exact(&mut buf) {
-                    Ok(_) if buf[0] == 0 => Ok(child),
-                    Ok(_) => {
-                        let _ = waitpid(child, None);
-                        Err(SandboxError::NamespaceCreation(
-                            "child namespace setup failed".to_string(),
-                        ))
-                    }
-                    Err(e) => {
-                        let _ = waitpid(child, None);
-                        Err(SandboxError::NamespaceCreation(format!(
-                            "failed to read from child: {e}"
-                        )))
-                    }
-                }
-            }
-            Ok(ForkResult::Child) => {
-                drop(read_fd);
-                let setup_result = create_namespaces(config);
-                let status = if setup_result.is_ok() { 0u8 } else { 1u8 };
-                let _ = nix::unistd::write(&write_fd, &[status]);
-                drop(write_fd);
-                if setup_result.is_err() {
-                    std::process::exit(1);
-                }
-                let exit_code = child_fn();
-                std::process::exit(exit_code);
-            }
-            Err(e) => Err(SandboxError::NamespaceCreation(format!("fork failed: {e}"))),
-        }
-    }
-
     /// Enter rootless mode by creating user and mount namespaces.
     /// After this call the process has CAP_SYS_ADMIN inside its own
     /// user namespace, enabling overlay/proc/tmpfs mounts without root.
@@ -621,23 +519,6 @@ pub fn enter_rootless_mode() -> Result<(), SandboxError> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn create_namespaces(_config: &NamespaceConfig) -> Result<(), SandboxError> {
-    Err(SandboxError::NamespaceCreation(
-        "namespaces are only available on Linux".to_string(),
-    ))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn enter_namespaces(_ns_fds: &NamespaceFds) -> Result<(), SandboxError> {
-    Err(SandboxError::NamespaceCreation(
-        "namespaces are only available on Linux".to_string(),
-    ))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn fork_with_namespaces<F>(_config: &NamespaceConfig, _child_fn: F) -> Result<i32, SandboxError>
-where
-    F: FnOnce() -> i32,
-{
     Err(SandboxError::NamespaceCreation(
         "namespaces are only available on Linux".to_string(),
     ))
