@@ -28,8 +28,10 @@
 //!     let task = Task::new("echo hello")
 //!         .timeout(std::time::Duration::from_secs(30));
 //!
-//!     let result = pool.execute(task).await?;
+//!     let session_id = pool.create_session().await?;
+//!     let result = pool.execute_in_session(&session_id, task).await?;
 //!     println!("Exit code: {}", result.exit_code);
+//!     pool.close_session(&session_id).await?;
 //!
 //!     Ok(())
 //! }

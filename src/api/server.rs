@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -42,11 +42,13 @@ struct ExecuteTaskRequest {
     working_dir: Option<PathBuf>,
     #[serde(default)]
     env: HashMap<String, String>,
+    session_id: String,
 }
 
 #[derive(Debug, Serialize)]
 struct ExecuteTaskResponse {
     task_id: String,
+    session_id: String,
     exit_code: i32,
     timed_out: bool,
     duration_ms: u128,
@@ -60,11 +62,17 @@ struct StatusResponse {
     total: usize,
     idle: usize,
     busy: usize,
+    reserved: usize,
     error: usize,
     tasks_executed: u64,
     tasks_succeeded: u64,
     tasks_failed: u64,
     avg_task_duration_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateSessionResponse {
+    session_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -75,6 +83,7 @@ struct ErrorResponse {
 #[derive(Debug, Serialize)]
 struct StreamStartEvent {
     task_id: String,
+    session_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +114,8 @@ pub async fn run_server(
     let api_routes = Router::new()
         .route("/api/v1/status", get(status))
         .route("/api/v1/tasks", post(execute_task))
+        .route("/api/v1/sessions", post(create_session))
+        .route("/api/v1/sessions/:session_id", delete(close_session))
         .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
 
     let app = Router::new()
@@ -171,6 +182,7 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         total: status.total,
         idle: status.idle,
         busy: status.busy,
+        reserved: status.reserved,
         error: status.error,
         tasks_executed: status.tasks_executed,
         tasks_succeeded: status.tasks_succeeded,
@@ -179,20 +191,48 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     })
 }
 
+async fn create_session(
+    State(state): State<AppState>,
+) -> Result<Json<CreateSessionResponse>, ApiError> {
+    let session_id = state
+        .pool
+        .create_session()
+        .await
+        .map_err(ApiError::from_pool_error)?;
+
+    Ok(Json(CreateSessionResponse { session_id }))
+}
+
+async fn close_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .pool
+        .close_session(&session_id)
+        .await
+        .map_err(ApiError::from_pool_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn execute_task(
     State(state): State<AppState>,
     Query(query): Query<RunTaskQuery>,
     Json(payload): Json<ExecuteTaskRequest>,
 ) -> Result<Response, ApiError> {
+    let session_id = payload.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err(ApiError::bad_request("session_id must not be empty"));
+    }
     let task = build_task(payload, &state.pool)?;
 
     if query.stream {
-        return Ok(stream_task(state.pool.clone(), task).into_response());
+        return Ok(stream_task(state.pool.clone(), task, session_id.clone()).into_response());
     }
 
     let result = state
         .pool
-        .execute(task)
+        .execute_in_session(&session_id, task)
         .await
         .map_err(ApiError::from_pool_error)?;
     let success = result.success();
@@ -201,6 +241,7 @@ async fn execute_task(
 
     Ok(Json(ExecuteTaskResponse {
         task_id: result.task_id,
+        session_id,
         exit_code: result.exit_code,
         timed_out: result.timed_out,
         duration_ms: result.duration.as_millis(),
@@ -214,13 +255,17 @@ async fn execute_task(
 fn stream_task(
     pool: Arc<Pool>,
     task: Task,
+    session_id: String,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     let task_id = task.id.clone();
+    let session_id_for_exec = session_id.clone();
     let (output_tx, mut output_rx) = mpsc::unbounded_channel::<TaskOutputEvent>();
     let (done_tx, mut done_rx) = oneshot::channel::<Result<apiary::TaskResult, PoolError>>();
 
     tokio::spawn(async move {
-        let result = pool.execute_with_events(task, output_tx).await;
+        let result = pool
+            .execute_in_session_with_events(&session_id_for_exec, task, Some(output_tx))
+            .await;
         let _ = done_tx.send(result);
     });
 
@@ -229,6 +274,7 @@ fn stream_task(
             "task_started",
             &StreamStartEvent {
                 task_id: task_id.clone(),
+                session_id: session_id.clone(),
             },
         ));
 
@@ -367,9 +413,9 @@ impl ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: "pool is shutting down".to_string(),
             },
-            PoolError::TaskSubmissionFailed(message) => Self {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: format!("task submission failed: {message}"),
+            PoolError::SessionNotFound(session_id) => Self {
+                status: StatusCode::NOT_FOUND,
+                message: format!("session not found: {session_id}"),
             },
             other => Self::internal(other.to_string()),
         }

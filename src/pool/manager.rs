@@ -1,7 +1,7 @@
 //! Sandbox pool manager implementation.
 //!
 //! The pool manager maintains a pre-created set of sandboxes and
-//! distributes tasks to idle sandboxes for execution.
+//! assigns them to persistent client sessions.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
+use uuid::Uuid;
 
 use crate::config::PoolConfig;
 use crate::sandbox::{Sandbox, SandboxError, SandboxState};
 use crate::task::{Task, TaskOutputEvent, TaskResult};
 
-/// Maximum time a task will wait for an idle sandbox before giving up.
+/// Maximum time session creation waits for an idle sandbox.
 const SANDBOX_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Errors that can occur during pool operations.
@@ -31,14 +32,14 @@ pub enum PoolError {
     #[error("sandbox error: {0}")]
     SandboxError(#[from] SandboxError),
 
-    #[error("task submission failed: {0}")]
-    TaskSubmissionFailed(String),
-
     #[error("pool is shutting down")]
     ShuttingDown,
 
     #[error("task execution failed: {0}")]
     ExecutionFailed(String),
+
+    #[error("session not found: {0}")]
+    SessionNotFound(String),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -50,6 +51,7 @@ pub struct PoolStatus {
     pub total: usize,
     pub idle: usize,
     pub busy: usize,
+    pub reserved: usize,
     pub error: usize,
     pub tasks_executed: u64,
     pub tasks_succeeded: u64,
@@ -57,10 +59,10 @@ pub struct PoolStatus {
     pub avg_task_duration_ms: u64,
 }
 
-struct TaskRequest {
-    task: Task,
-    response: oneshot::Sender<Result<TaskResult, PoolError>>,
-    output_events: Option<mpsc::UnboundedSender<TaskOutputEvent>>,
+#[derive(Clone)]
+struct SessionHandle {
+    sandbox_id: String,
+    execution_lock: Arc<AsyncMutex<()>>,
 }
 
 /// A sandbox pool that manages multiple sandboxes for task execution.
@@ -69,7 +71,7 @@ pub struct Pool {
     sandboxes: Arc<RwLock<HashMap<String, Arc<Sandbox>>>>,
     idle_queue: Arc<Mutex<Vec<String>>>,
     idle_notify: Arc<Notify>,
-    task_tx: mpsc::Sender<TaskRequest>,
+    sessions: Arc<RwLock<HashMap<String, SessionHandle>>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -79,38 +81,19 @@ impl Pool {
         let sandboxes = Arc::new(RwLock::new(HashMap::new()));
         let idle_queue = Arc::new(Mutex::new(Vec::new()));
         let idle_notify = Arc::new(Notify::new());
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let (task_tx, task_rx) = mpsc::channel::<TaskRequest>(config.pool_size * 2);
 
         let pool = Self {
             config: config.clone(),
             sandboxes: sandboxes.clone(),
             idle_queue: idle_queue.clone(),
             idle_notify: idle_notify.clone(),
-            task_tx,
+            sessions: sessions.clone(),
             shutdown: shutdown.clone(),
         };
 
         pool.initialize_sandboxes().await?;
-
-        let d_sandboxes = sandboxes.clone();
-        let d_idle_queue = idle_queue.clone();
-        let d_idle_notify = idle_notify.clone();
-        let d_shutdown = shutdown.clone();
-        let d_config = config.clone();
-
-        tokio::spawn(async move {
-            task_dispatcher(
-                task_rx,
-                d_sandboxes,
-                d_idle_queue,
-                d_idle_notify,
-                d_shutdown,
-                d_config,
-            )
-            .await;
-        });
 
         Ok(pool)
     }
@@ -140,62 +123,166 @@ impl Pool {
         Ok(())
     }
 
-    pub async fn execute(&self, task: Task) -> Result<TaskResult, PoolError> {
+    /// Create a persistent session bound to a single sandbox.
+    ///
+    /// Tasks executed through this session keep filesystem changes until
+    /// [`Pool::close_session`] is called.
+    pub async fn create_session(&self) -> Result<String, PoolError> {
         if self.shutdown.load(Ordering::Relaxed) {
             return Err(PoolError::ShuttingDown);
         }
 
-        let (response_tx, response_rx) = oneshot::channel();
-        let request = TaskRequest {
-            task,
-            response: response_tx,
-            output_events: None,
+        let sandbox = acquire_idle_sandbox(
+            &self.sandboxes,
+            &self.idle_queue,
+            &self.idle_notify,
+            &self.shutdown,
+        )
+        .await
+        .ok_or_else(|| {
+            if self.shutdown.load(Ordering::Relaxed) {
+                PoolError::ShuttingDown
+            } else {
+                PoolError::NoIdleSandbox(SANDBOX_ACQUIRE_TIMEOUT.as_secs())
+            }
+        })?;
+
+        let session_id = loop {
+            let id = Uuid::new_v4().to_string();
+            if !self.sessions.read().contains_key(&id) {
+                break id;
+            }
         };
 
-        self.task_tx
-            .send(request)
-            .await
-            .map_err(|_| PoolError::TaskSubmissionFailed("channel closed".to_string()))?;
+        self.sessions.write().insert(
+            session_id.clone(),
+            SessionHandle {
+                sandbox_id: sandbox.id().to_string(),
+                execution_lock: Arc::new(AsyncMutex::new(())),
+            },
+        );
 
-        response_rx
-            .await
-            .map_err(|_| PoolError::ExecutionFailed("response channel dropped".to_string()))?
+        tracing::info!(session_id = %session_id, sandbox_id = %sandbox.id(), "session created");
+        Ok(session_id)
     }
 
-    pub async fn execute_with_events(
+    /// Execute a task inside a persistent session.
+    pub async fn execute_in_session(
         &self,
+        session_id: &str,
         task: Task,
-        output_events: mpsc::UnboundedSender<TaskOutputEvent>,
+    ) -> Result<TaskResult, PoolError> {
+        self.execute_in_session_with_events(session_id, task, None)
+            .await
+    }
+
+    /// Execute a task inside a persistent session and optionally stream output events.
+    pub async fn execute_in_session_with_events(
+        &self,
+        session_id: &str,
+        task: Task,
+        output_events: Option<mpsc::UnboundedSender<TaskOutputEvent>>,
     ) -> Result<TaskResult, PoolError> {
         if self.shutdown.load(Ordering::Relaxed) {
             return Err(PoolError::ShuttingDown);
         }
 
-        let (response_tx, response_rx) = oneshot::channel();
-        let request = TaskRequest {
-            task,
-            response: response_tx,
-            output_events: Some(output_events),
+        let session = {
+            let sessions = self.sessions.read();
+            sessions
+                .get(session_id)
+                .cloned()
+                .ok_or_else(|| PoolError::SessionNotFound(session_id.to_string()))?
         };
 
-        self.task_tx
-            .send(request)
-            .await
-            .map_err(|_| PoolError::TaskSubmissionFailed("channel closed".to_string()))?;
+        let sandbox = {
+            let sandboxes = self.sandboxes.read();
+            sandboxes.get(&session.sandbox_id).cloned().ok_or_else(|| {
+                PoolError::ExecutionFailed(format!(
+                    "session {session_id} is bound to missing sandbox {}",
+                    session.sandbox_id
+                ))
+            })?
+        };
 
-        response_rx
+        let _execution_guard = session.execution_lock.lock().await;
+
+        // Prevent races with close_session: if the session disappeared while
+        // waiting for the lock, do not run the task.
+        {
+            let sessions = self.sessions.read();
+            match sessions.get(session_id) {
+                Some(current) if current.sandbox_id == session.sandbox_id => {}
+                _ => return Err(PoolError::SessionNotFound(session_id.to_string())),
+            }
+        }
+
+        sandbox
+            .execute_with_events(task, output_events)
             .await
-            .map_err(|_| PoolError::ExecutionFailed("response channel dropped".to_string()))?
+            .map_err(PoolError::SandboxError)
     }
 
-    pub async fn execute_batch(&self, tasks: Vec<Task>) -> Vec<Result<TaskResult, PoolError>> {
-        let futures: Vec<_> = tasks.into_iter().map(|task| self.execute(task)).collect();
-        futures::future::join_all(futures).await
+    /// Close a persistent session, reset its sandbox, and return it to the idle pool.
+    pub async fn close_session(&self, session_id: &str) -> Result<(), PoolError> {
+        let session = {
+            let mut sessions = self.sessions.write();
+            sessions
+                .remove(session_id)
+                .ok_or_else(|| PoolError::SessionNotFound(session_id.to_string()))?
+        };
+
+        // Wait for any in-flight session execution to complete before reset.
+        let _execution_guard = session.execution_lock.lock().await;
+
+        let sandbox = {
+            let sandboxes = self.sandboxes.read();
+            sandboxes.get(&session.sandbox_id).cloned().ok_or_else(|| {
+                PoolError::ExecutionFailed(format!(
+                    "session {session_id} is bound to missing sandbox {}",
+                    session.sandbox_id
+                ))
+            })?
+        };
+
+        match sandbox.reset().await {
+            Ok(()) => {
+                self.idle_queue.lock().push(session.sandbox_id.clone());
+                self.idle_notify.notify_one();
+                tracing::info!(
+                    session_id = %session_id,
+                    sandbox_id = %session.sandbox_id,
+                    "session closed"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    session_id = %session_id,
+                    sandbox_id = %session.sandbox_id,
+                    "session sandbox reset failed; replacing"
+                );
+                self.sandboxes.write().remove(&session.sandbox_id);
+                drop(sandbox);
+
+                replace_sandbox(
+                    &session.sandbox_id,
+                    &self.config,
+                    &self.sandboxes,
+                    &self.idle_queue,
+                    &self.idle_notify,
+                )
+                .await?;
+                Ok(())
+            }
+        }
     }
 
     pub fn status(&self) -> PoolStatus {
         let sandboxes = self.sandboxes.read();
         let idle_count = self.idle_queue.lock().len();
+        let reserved_count = self.sessions.read().len();
 
         let mut busy = 0;
         let mut error = 0;
@@ -228,6 +315,7 @@ impl Pool {
             total: sandboxes.len(),
             idle: idle_count,
             busy,
+            reserved: reserved_count,
             error,
             tasks_executed,
             tasks_succeeded,
@@ -244,6 +332,16 @@ impl Pool {
         tracing::info!("Shutting down pool...");
         self.shutdown.store(true, Ordering::Relaxed);
         self.idle_notify.notify_waiters();
+
+        // Proactively close all sessions so their sandboxes are reset before
+        // final cleanup. This keeps shutdown behavior deterministic in
+        // session-only mode.
+        let session_ids: Vec<String> = self.sessions.read().keys().cloned().collect();
+        for session_id in session_ids {
+            if let Err(error) = self.close_session(&session_id).await {
+                tracing::error!(%error, session_id = %session_id, "failed to close session during shutdown");
+            }
+        }
 
         let timeout = Duration::from_secs(30);
         let start = Instant::now();
@@ -289,99 +387,6 @@ impl Pool {
 impl Drop for Pool {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Task dispatcher with backpressure and sandbox recovery
-// ---------------------------------------------------------------------------
-
-async fn task_dispatcher(
-    mut task_rx: mpsc::Receiver<TaskRequest>,
-    sandboxes: Arc<RwLock<HashMap<String, Arc<Sandbox>>>>,
-    idle_queue: Arc<Mutex<Vec<String>>>,
-    idle_notify: Arc<Notify>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-    config: Arc<PoolConfig>,
-) {
-    while let Some(request) = task_rx.recv().await {
-        if shutdown.load(Ordering::Relaxed) {
-            let _ = request.response.send(Err(PoolError::ShuttingDown));
-            continue;
-        }
-
-        // Spawn each request as its own task so the dispatcher loop
-        // is never blocked; each spawned task waits for an idle sandbox.
-        let sandboxes = sandboxes.clone();
-        let idle_queue = idle_queue.clone();
-        let idle_notify = idle_notify.clone();
-        let shutdown = shutdown.clone();
-        let config = config.clone();
-
-        tokio::spawn(async move {
-            let sandbox = acquire_idle_sandbox(
-                &sandboxes,
-                &idle_queue,
-                &idle_notify,
-                &shutdown,
-            )
-            .await;
-
-            match sandbox {
-                Some(sandbox) => {
-                    let sandbox_id = sandbox.id().to_string();
-                    let TaskRequest {
-                        task,
-                        response,
-                        output_events,
-                    } = request;
-
-                    let result = sandbox.execute_with_events(task, output_events).await;
-
-                    match sandbox.reset().await {
-                        Ok(()) => {
-                            idle_queue.lock().push(sandbox_id);
-                            idle_notify.notify_one();
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                %error,
-                                sandbox_id = %sandbox_id,
-                                "sandbox reset failed; replacing"
-                            );
-                            sandboxes.write().remove(&sandbox_id);
-                            drop(sandbox);
-
-                            if let Err(e) = replace_sandbox(
-                                &sandbox_id,
-                                &config,
-                                &sandboxes,
-                                &idle_queue,
-                                &idle_notify,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    %e,
-                                    sandbox_id = %sandbox_id,
-                                    "sandbox replacement failed; pool capacity reduced"
-                                );
-                            }
-                        }
-                    }
-
-                    let _ = response.send(result.map_err(PoolError::SandboxError));
-                }
-                None => {
-                    let err = if shutdown.load(Ordering::Relaxed) {
-                        PoolError::ShuttingDown
-                    } else {
-                        PoolError::NoIdleSandbox(SANDBOX_ACQUIRE_TIMEOUT.as_secs())
-                    };
-                    let _ = request.response.send(Err(err));
-                }
-            }
-        });
     }
 }
 
@@ -438,9 +443,7 @@ async fn replace_sandbox(
         .map_err(|e| PoolError::InitFailed(format!("replacement init failed: {e}")))?;
 
     let sandbox = Arc::new(sandbox);
-    sandboxes
-        .write()
-        .insert(sandbox_id.to_string(), sandbox);
+    sandboxes.write().insert(sandbox_id.to_string(), sandbox);
     idle_queue.lock().push(sandbox_id.to_string());
     idle_notify.notify_one();
 
@@ -458,6 +461,7 @@ mod tests {
             total: 10,
             idle: 8,
             busy: 2,
+            reserved: 2,
             error: 0,
             tasks_executed: 100,
             tasks_succeeded: 95,
@@ -465,6 +469,7 @@ mod tests {
             avg_task_duration_ms: 500,
         };
 
-        assert_eq!(status.total, status.idle + status.busy + status.error);
+        assert_eq!(status.total, status.idle + status.reserved + status.error);
+        assert!(status.busy <= status.total);
     }
 }

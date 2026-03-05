@@ -12,6 +12,7 @@ A lightweight sandbox pool for running AI agent tasks on Linux with namespace is
 - **Pool Management**: Pre-created sandbox pool for fast task execution
 - **Batch Execution**: Run multiple tasks in parallel
 - **Daemon API**: HTTP REST with optional SSE task streaming
+- **Persistent Sessions**: Pin a sandbox to a session and keep filesystem state across commands
 
 ## Requirements
 
@@ -134,22 +135,28 @@ apiary status
 apiary clean --force
 ```
 
+`apiary run` and `apiary batch` now run in session-only mode internally:
+they create session(s), execute command(s), then close session(s) to release sandboxes.
+
 ### Daemon HTTP API
 
 When running `apiary daemon`, the server exposes:
 
 - `GET /healthz` - liveness probe
-- `GET /api/v1/status` - pool status and counters
-- `POST /api/v1/tasks` - execute a task and return JSON result
-- `POST /api/v1/tasks?stream=true` - execute a task and stream output via SSE
+- `GET /api/v1/status` - pool status and counters (includes `reserved` session sandboxes)
+- `POST /api/v1/sessions` - create a persistent session (reserves one sandbox)
+- `DELETE /api/v1/sessions/:session_id` - close session, reset sandbox, and release it
+- `POST /api/v1/tasks` - execute a task in a session and return JSON result (`session_id` required)
+- `POST /api/v1/tasks?stream=true` - execute a task in a session and stream output via SSE (`session_id` required)
 
-Example JSON task request:
+Example JSON task request (`session_id` is required):
 
 ```json
 {
   "command": "bash -lc 'echo start && sleep 1 && echo done'",
   "timeout_secs": 30,
   "working_dir": "/workspace",
+  "session_id": "required-session-id",
   "env": {
     "MY_VAR": "hello"
   }
@@ -159,22 +166,50 @@ Example JSON task request:
 Execute and wait for final JSON result:
 
 ```bash
+# Create or reuse a session first
+SESSION_ID=$(curl -sS -X POST "http://127.0.0.1:8080/api/v1/sessions" | jq -r '.session_id')
+
 curl -sS \
   -X POST "http://127.0.0.1:8080/api/v1/tasks" \
   -H "Content-Type: application/json" \
-  -d '{"command":"echo hello from api"}'
+  -d "{\"command\":\"echo hello from api\",\"session_id\":\"${SESSION_ID}\"}"
 ```
 
 Execute with SSE streaming:
 
 ```bash
+# Reuse the same SESSION_ID
 curl -N \
   -X POST "http://127.0.0.1:8080/api/v1/tasks?stream=true" \
   -H "Content-Type: application/json" \
-  -d '{"command":"bash -lc '\''echo out; echo err 1>&2; sleep 1; echo done'\''"}'
+  -d "{\"command\":\"bash -lc 'echo out; echo err 1>&2; sleep 1; echo done'\",\"session_id\":\"${SESSION_ID}\"}"
+```
+
+Create and use a persistent session (filesystem changes survive between commands):
+
+```bash
+# 1) Create session
+SESSION_ID=$(curl -sS -X POST "http://127.0.0.1:8080/api/v1/sessions" | jq -r '.session_id')
+
+# 2) First command writes a file
+curl -sS \
+  -X POST "http://127.0.0.1:8080/api/v1/tasks" \
+  -H "Content-Type: application/json" \
+  -d "{\"command\":\"bash -lc 'echo hello > /workspace/marker.txt'\",\"session_id\":\"${SESSION_ID}\"}"
+
+# 3) Second command in same session can still read it
+curl -sS \
+  -X POST "http://127.0.0.1:8080/api/v1/tasks" \
+  -H "Content-Type: application/json" \
+  -d "{\"command\":\"cat /workspace/marker.txt\",\"session_id\":\"${SESSION_ID}\"}"
+
+# 4) Close session and release sandbox back to pool
+curl -sS -X DELETE "http://127.0.0.1:8080/api/v1/sessions/${SESSION_ID}"
 ```
 
 ### Library API
+
+The library is session-only: create a session before execution, and close it when done.
 
 ```rust
 use apiary::{Pool, PoolConfig, Task};
@@ -196,17 +231,12 @@ async fn main() -> anyhow::Result<()> {
         .timeout(Duration::from_secs(30))
         .env("MY_VAR", "value");
 
-    let result = pool.execute(task).await?;
+    let session_id = pool.create_session().await?;
+    let result = pool.execute_in_session(&session_id, task).await?;
     println!("Exit code: {}", result.exit_code);
     println!("Output: {}", result.stdout_lossy());
 
-    // Execute batch
-    let tasks = vec![
-        Task::new("echo task1"),
-        Task::new("echo task2"),
-        Task::new("echo task3"),
-    ];
-    let results = pool.execute_batch(tasks).await;
+    pool.close_session(&session_id).await?;
 
     pool.shutdown().await;
     Ok(())

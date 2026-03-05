@@ -13,6 +13,7 @@
 //! ```
 
 use apiary::{Pool, PoolConfig, Task};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
@@ -48,7 +49,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Initialize the pool
     println!("Initializing pool...");
-    let pool = Pool::new(config).await?;
+    let pool = Arc::new(Pool::new(config).await?);
     println!("Pool ready: {} sandboxes", pool.status().total);
 
     // Create a batch of tasks
@@ -68,9 +69,33 @@ async fn async_main() -> anyhow::Result<()> {
     println!("Submitting {} tasks...", tasks.len());
     println!();
 
-    // Execute all tasks in parallel
+    // Execute all tasks in parallel (each task gets its own session).
     let start = std::time::Instant::now();
-    let results = pool.execute_batch(tasks).await;
+    let results = futures::future::join_all(tasks.into_iter().map(|task| {
+        let pool = pool.clone();
+        async move {
+            let session_id = pool.create_session().await?;
+            let execution_result = pool.execute_in_session(&session_id, task).await;
+            let close_result = pool.close_session(&session_id).await;
+
+            match close_result {
+                Ok(()) => execution_result,
+                Err(close_error) => {
+                    if execution_result.is_ok() {
+                        Err(close_error)
+                    } else {
+                        tracing::error!(
+                            %close_error,
+                            session_id = %session_id,
+                            "failed to close session after task error"
+                        );
+                        execution_result
+                    }
+                }
+            }
+        }
+    }))
+    .await;
     let elapsed = start.elapsed();
 
     // Print results

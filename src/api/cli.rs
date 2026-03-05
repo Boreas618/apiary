@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use apiary::{Pool, PoolConfig, Task};
+use apiary::{Pool, PoolConfig, PoolError, Task};
 
 use crate::api::server;
 
@@ -138,9 +138,39 @@ pub async fn run_task(
         task = task.working_dir(&config.default_workdir);
     }
 
-    tracing::info!("Executing: {command}");
+    let session_id = match pool.create_session().await {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            pool.shutdown().await;
+            return Err(error.into());
+        }
+    };
+    tracing::info!(session_id = %session_id, "Created CLI session");
+    tracing::info!("Executing in session {session_id}: {command}");
 
-    let result = pool.execute(task).await?;
+    let execution_result = pool.execute_in_session(&session_id, task).await;
+    let close_result = pool.close_session(&session_id).await;
+    let result = match (execution_result, close_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Ok(_), Err(close_error)) => Err(anyhow::Error::from(close_error)),
+        (Err(exec_error), Ok(())) => Err(anyhow::Error::from(exec_error)),
+        (Err(exec_error), Err(close_error)) => {
+            tracing::error!(
+                %close_error,
+                session_id = %session_id,
+                "Failed to close CLI session after task error"
+            );
+            Err(anyhow::Error::from(exec_error))
+        }
+    };
+
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            pool.shutdown().await;
+            return Err(error);
+        }
+    };
 
     if !result.stdout.is_empty() {
         print!("{}", result.stdout_lossy());
@@ -201,16 +231,43 @@ pub async fn run_batch(
         ..config
     };
 
-    let pool = Pool::new(config).await?;
-
     let tasks_content = std::fs::read_to_string(&tasks_file)?;
     let tasks: Vec<Task> = serde_json::from_str(&tasks_content)?;
 
+    let pool = Pool::new(config).await?;
+
     tracing::info!("Loaded {} tasks from {}", tasks.len(), tasks_file.display());
-    tracing::info!("Running with parallelism: {parallelism}");
+    tracing::info!("Running with parallelism: {parallelism} (session-only mode)");
 
     let start = std::time::Instant::now();
-    let results = pool.execute_batch(tasks).await;
+    let pool = Arc::new(pool);
+    let results: Vec<Result<apiary::TaskResult, PoolError>> = futures::future::join_all(
+        tasks.into_iter().map(|task| {
+            let pool = pool.clone();
+            async move {
+                let session_id = pool.create_session().await?;
+                let execution_result = pool.execute_in_session(&session_id, task).await;
+                let close_result = pool.close_session(&session_id).await;
+
+                match close_result {
+                    Ok(()) => execution_result,
+                    Err(close_error) => {
+                        if execution_result.is_ok() {
+                            Err(close_error)
+                        } else {
+                            tracing::error!(
+                                %close_error,
+                                session_id = %session_id,
+                                "Failed to close batch session after task error"
+                            );
+                            execution_result
+                        }
+                    }
+                }
+            }
+        }),
+    )
+    .await;
     let duration = start.elapsed();
 
     let mut succeeded = 0;
