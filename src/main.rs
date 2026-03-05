@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod api;
@@ -33,9 +34,25 @@ enum Commands {
         #[arg(long)]
         base_image: PathBuf,
 
-        /// Number of sandboxes in the pool
+        /// Minimum number of sandboxes (created at startup)
         #[arg(long, default_value = "10")]
-        pool_size: usize,
+        min_sandboxes: usize,
+
+        /// Maximum number of sandboxes (hard ceiling for auto-scaling)
+        #[arg(long, default_value = "40")]
+        max_sandboxes: usize,
+
+        /// Number of sandboxes to create per scale-up event
+        #[arg(long, default_value = "2")]
+        scale_up_step: usize,
+
+        /// How long (seconds) an excess sandbox can be idle before removal
+        #[arg(long, default_value = "300")]
+        idle_timeout_secs: u64,
+
+        /// Minimum seconds between scaling events
+        #[arg(long, default_value = "30")]
+        cooldown_secs: u64,
 
         /// Directory to store overlay layers
         #[arg(long)]
@@ -122,10 +139,25 @@ async fn async_main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Init {
             base_image,
-            pool_size,
+            min_sandboxes,
+            max_sandboxes,
+            scale_up_step,
+            idle_timeout_secs,
+            cooldown_secs,
             overlay_dir,
         } => {
-            api::cli::init_pool(base_image, pool_size, overlay_dir, cli.config, seccomp).await?;
+            api::cli::init_pool(
+                base_image,
+                min_sandboxes,
+                max_sandboxes,
+                scale_up_step,
+                Duration::from_secs(idle_timeout_secs),
+                Duration::from_secs(cooldown_secs),
+                overlay_dir,
+                cli.config,
+                seccomp,
+            )
+            .await?;
         }
         Commands::Daemon { bind, api_token } => {
             api::cli::run_daemon(bind, api_token, cli.config, seccomp).await?;

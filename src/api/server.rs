@@ -1,34 +1,23 @@
 //! HTTP server for daemon mode.
 
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
-use async_stream::stream;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
 
-use apiary::{Pool, PoolError, Task, TaskOutputEvent};
+use apiary::{Pool, PoolError, Task};
 
 #[derive(Clone)]
 struct AppState {
-    pool: Arc<Pool>,
+    pool: Pool,
     api_token: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RunTaskQuery {
-    #[serde(default)]
-    stream: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +53,8 @@ struct StatusResponse {
     busy: usize,
     reserved: usize,
     error: usize,
+    min_sandboxes: usize,
+    max_sandboxes: usize,
     tasks_executed: u64,
     tasks_succeeded: u64,
     tasks_failed: u64,
@@ -80,30 +71,9 @@ struct ErrorResponse {
     error: String,
 }
 
-#[derive(Debug, Serialize)]
-struct StreamStartEvent {
-    task_id: String,
-    session_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct StreamChunkEvent {
-    stream: &'static str,
-    data: String,
-}
-
-#[derive(Debug, Serialize)]
-struct StreamDoneEvent {
-    task_id: String,
-    exit_code: i32,
-    timed_out: bool,
-    duration_ms: u128,
-    success: bool,
-}
-
 pub async fn run_server(
     bind: String,
-    pool: Arc<Pool>,
+    pool: Pool,
     api_token: Option<String>,
 ) -> anyhow::Result<()> {
     let state = AppState {
@@ -184,6 +154,8 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         busy: status.busy,
         reserved: status.reserved,
         error: status.error,
+        min_sandboxes: status.min_sandboxes,
+        max_sandboxes: status.max_sandboxes,
         tasks_executed: status.tasks_executed,
         tasks_succeeded: status.tasks_succeeded,
         tasks_failed: status.tasks_failed,
@@ -217,7 +189,6 @@ async fn close_session(
 
 async fn execute_task(
     State(state): State<AppState>,
-    Query(query): Query<RunTaskQuery>,
     Json(payload): Json<ExecuteTaskRequest>,
 ) -> Result<Response, ApiError> {
     let session_id = payload.session_id.trim().to_string();
@@ -225,10 +196,6 @@ async fn execute_task(
         return Err(ApiError::bad_request("session_id must not be empty"));
     }
     let task = build_task(payload, &state.pool)?;
-
-    if query.stream {
-        return Ok(stream_task(state.pool.clone(), task, session_id.clone()).into_response());
-    }
 
     let result = state
         .pool
@@ -252,109 +219,6 @@ async fn execute_task(
     .into_response())
 }
 
-fn stream_task(
-    pool: Arc<Pool>,
-    task: Task,
-    session_id: String,
-) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let task_id = task.id.clone();
-    let session_id_for_exec = session_id.clone();
-    let (output_tx, mut output_rx) = mpsc::unbounded_channel::<TaskOutputEvent>();
-    let (done_tx, mut done_rx) = oneshot::channel::<Result<apiary::TaskResult, PoolError>>();
-
-    tokio::spawn(async move {
-        let result = pool
-            .execute_in_session_with_events(&session_id_for_exec, task, Some(output_tx))
-            .await;
-        let _ = done_tx.send(result);
-    });
-
-    let event_stream = stream! {
-        yield Ok(json_event(
-            "task_started",
-            &StreamStartEvent {
-                task_id: task_id.clone(),
-                session_id: session_id.clone(),
-            },
-        ));
-
-        let mut output_open = true;
-        loop {
-            tokio::select! {
-                maybe_event = output_rx.recv(), if output_open => {
-                    match maybe_event {
-                        Some(event) => {
-                            let payload = match event {
-                                TaskOutputEvent::Stdout(bytes) => StreamChunkEvent {
-                                    stream: "stdout",
-                                    data: String::from_utf8_lossy(&bytes).into_owned(),
-                                },
-                                TaskOutputEvent::Stderr(bytes) => StreamChunkEvent {
-                                    stream: "stderr",
-                                    data: String::from_utf8_lossy(&bytes).into_owned(),
-                                },
-                            };
-                            yield Ok(json_event("task_output", &payload));
-                        }
-                        None => {
-                            output_open = false;
-                        }
-                    }
-                }
-                result = &mut done_rx => {
-                    match result {
-                        Ok(Ok(task_result)) => {
-                            let success = task_result.success();
-                            yield Ok(json_event(
-                                "task_done",
-                                &StreamDoneEvent {
-                                    task_id: task_result.task_id,
-                                    exit_code: task_result.exit_code,
-                                    timed_out: task_result.timed_out,
-                                    duration_ms: task_result.duration.as_millis(),
-                                    success,
-                                },
-                            ));
-                        }
-                        Ok(Err(pool_error)) => {
-                            yield Ok(json_event(
-                                "error",
-                                &ErrorResponse {
-                                    error: pool_error.to_string(),
-                                },
-                            ));
-                        }
-                        Err(recv_error) => {
-                            yield Ok(json_event(
-                                "error",
-                                &ErrorResponse {
-                                    error: format!("task result channel failed: {recv_error}"),
-                                },
-                            ));
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-    };
-
-    Sse::new(event_stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(10))
-            .text("keep-alive"),
-    )
-}
-
-fn json_event<T: Serialize>(name: &str, payload: &T) -> Event {
-    match serde_json::to_string(payload) {
-        Ok(json) => Event::default().event(name).data(json),
-        Err(e) => Event::default()
-            .event("error")
-            .data(format!("failed to serialize {name} payload: {e}")),
-    }
-}
-
 fn build_task(payload: ExecuteTaskRequest, pool: &Pool) -> Result<Task, ApiError> {
     let command = payload.command.trim();
     if command.is_empty() {
@@ -372,12 +236,10 @@ fn build_task(payload: ExecuteTaskRequest, pool: &Pool) -> Result<Task, ApiError
     let mut env = pool.config().default_env.clone();
     env.extend(payload.env);
 
-    let mut task = Task::new(command).timeout(timeout).envs(env);
-    if let Some(working_dir) = payload.working_dir {
-        task = task.working_dir(working_dir);
-    } else {
-        task = task.working_dir(pool.config().default_workdir.clone());
-    }
+    let working_dir = payload
+        .working_dir
+        .unwrap_or_else(|| pool.config().default_workdir.clone());
+    let task = Task::new(command).timeout(timeout).envs(env).working_dir(working_dir);
 
     Ok(task)
 }

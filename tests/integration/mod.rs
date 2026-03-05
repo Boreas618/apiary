@@ -14,12 +14,6 @@ use std::time::Duration;
 /// Check if we can run namespace tests.
 #[allow(dead_code)]
 fn can_run_namespace_tests() -> bool {
-    // Check if we're on Linux
-    if !cfg!(target_os = "linux") {
-        return false;
-    }
-
-    // Check if user namespaces are available
     let status = std::process::Command::new("unshare")
         .args(["--user", "true"])
         .status();
@@ -57,19 +51,32 @@ fn test_task_builder() {
 #[test]
 fn test_config_builder() {
     let config = PoolConfig::builder()
-        .pool_size(5)
+        .min_sandboxes(5)
+        .max_sandboxes(20)
         .base_image("/tmp/rootfs")
         .build();
 
     assert!(config.is_ok());
     let config = config.unwrap();
-    assert_eq!(config.pool_size, 5);
+    assert_eq!(config.min_sandboxes, 5);
+    assert_eq!(config.max_sandboxes, 20);
 }
 
 #[test]
-fn test_config_builder_rejects_zero_pool_size() {
+fn test_config_builder_rejects_zero_min_sandboxes() {
     let result = PoolConfig::builder()
-        .pool_size(0)
+        .min_sandboxes(0)
+        .base_image("/tmp/rootfs")
+        .build();
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_config_builder_rejects_max_less_than_min() {
+    let result = PoolConfig::builder()
+        .min_sandboxes(10)
+        .max_sandboxes(5)
         .base_image("/tmp/rootfs")
         .build();
 
@@ -78,7 +85,7 @@ fn test_config_builder_rejects_zero_pool_size() {
 
 #[test]
 fn test_config_builder_requires_base_image() {
-    let result = PoolConfig::builder().pool_size(5).build();
+    let result = PoolConfig::builder().min_sandboxes(5).build();
 
     assert!(result.is_err());
 }
@@ -86,16 +93,19 @@ fn test_config_builder_requires_base_image() {
 #[test]
 fn test_config_serialization() {
     let config = PoolConfig::builder()
-        .pool_size(10)
+        .min_sandboxes(10)
+        .max_sandboxes(40)
         .base_image("/tmp/rootfs")
         .build()
         .unwrap();
 
-    let toml = toml::to_string(&config).unwrap();
-    assert!(toml.contains("pool_size = 10"));
+    let toml_str = toml::to_string(&config).unwrap();
+    assert!(toml_str.contains("min_sandboxes = 10"));
+    assert!(toml_str.contains("max_sandboxes = 40"));
 
-    let parsed: PoolConfig = toml::from_str(&toml).unwrap();
-    assert_eq!(parsed.pool_size, config.pool_size);
+    let parsed: PoolConfig = toml::from_str(&toml_str).unwrap();
+    assert_eq!(parsed.min_sandboxes, config.min_sandboxes);
+    assert_eq!(parsed.max_sandboxes, config.max_sandboxes);
 }
 
 #[test]
@@ -113,8 +123,6 @@ fn test_task_result() {
     assert_eq!(result.stdout_str().unwrap(), "hello\n");
 }
 
-// Tests that require Linux namespace support
-#[cfg(target_os = "linux")]
 mod linux_tests {
     use super::*;
     use apiary::Pool;
@@ -156,9 +164,9 @@ mod linux_tests {
 
     #[tokio::test]
     async fn test_pool_creation_without_base_image() {
-        // This should fail because the base image doesn't exist
         let config = PoolConfig::builder()
-            .pool_size(1)
+            .min_sandboxes(1)
+            .max_sandboxes(4)
             .base_image("/nonexistent/rootfs")
             .build()
             .unwrap();

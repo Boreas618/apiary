@@ -22,9 +22,11 @@
 
 use std::path::Path;
 
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use serde::{Deserialize, Serialize};
 
 use super::SandboxError;
+use crate::sandbox::namespace;
 
 /// Which overlay implementation to use.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -45,409 +47,20 @@ pub enum OverlayDriver {
 pub enum ActiveOverlay {
     KernelOverlay,
     FuseOverlayfs,
-    /// Non-Linux stub (no real mount).
-    Stub,
 }
 
-// ---------------------------------------------------------------------------
-// Linux-specific implementations
-// ---------------------------------------------------------------------------
-#[cfg(target_os = "linux")]
-mod linux_impl {
-    use super::*;
-    use crate::sandbox::namespace;
-    use nix::mount::{mount, umount2, MntFlags, MsFlags};
-
-    /// Setup an OverlayFS mount using the configured driver strategy.
-    ///
-    /// Returns the [`ActiveOverlay`] variant that was successfully used,
-    /// so callers can pass it to [`unmount_overlay`] later.
-    pub fn setup_overlay(
-        merged: &Path,
-        upper: &Path,
-        work: &Path,
-        lower: &Path,
-        driver: &OverlayDriver,
-    ) -> Result<ActiveOverlay, SandboxError> {
-        create_overlay_dirs(upper, work, merged)?;
-
-        if !lower.exists() {
-            return Err(SandboxError::OverlaySetup(format!(
-                "lower layer does not exist: {}",
-                lower.display()
-            )));
-        }
-
-        let rootless = namespace::is_rootless_mode();
-
-        match driver {
-            OverlayDriver::Auto => {
-                match try_kernel_overlay(merged, upper, work, lower, rootless) {
-                    Ok(()) => {
-                        tracing::info!("Using kernel overlayfs");
-                        Ok(ActiveOverlay::KernelOverlay)
-                    }
-                    Err(kernel_err) => {
-                        tracing::warn!(
-                            %kernel_err,
-                            "Kernel overlay mount failed; trying fuse-overlayfs"
-                        );
-                        try_fuse_overlayfs(merged, upper, work, lower).map_err(|fuse_err| {
-                            SandboxError::OverlaySetup(format!(
-                                "All overlay drivers failed.\n\
-                                 Kernel overlay: {kernel_err}\n\
-                                 fuse-overlayfs: {fuse_err}\n\n\
-                                 Possible fixes:\n\
-                                 - Install fuse-overlayfs: apt install fuse-overlayfs (Debian/Ubuntu) \
-                                   or dnf install fuse-overlayfs (Fedora/RHEL)\n\
-                                 - Use a kernel >= 5.11 with unprivileged overlay support\n\
-                                 - Check AppArmor/SELinux policies that may block overlay mounts\n\
-                                 - Run as root (not recommended)"
-                            ))
-                        })?;
-                        tracing::info!("Using fuse-overlayfs (kernel overlay unavailable)");
-                        Ok(ActiveOverlay::FuseOverlayfs)
-                    }
-                }
-            }
-            OverlayDriver::KernelOverlay => {
-                try_kernel_overlay(merged, upper, work, lower, rootless)?;
-                tracing::info!("Using kernel overlayfs (forced)");
-                Ok(ActiveOverlay::KernelOverlay)
-            }
-            OverlayDriver::FuseOverlayfs => {
-                try_fuse_overlayfs(merged, upper, work, lower)?;
-                tracing::info!("Using fuse-overlayfs (forced)");
-                Ok(ActiveOverlay::FuseOverlayfs)
-            }
-        }
-    }
-
-    fn try_kernel_overlay(
-        merged: &Path,
-        upper: &Path,
-        work: &Path,
-        lower: &Path,
-        rootless: bool,
-    ) -> Result<(), SandboxError> {
-        let mut options = format!(
-            "lowerdir={},upperdir={},workdir={}",
-            lower.display(),
-            upper.display(),
-            work.display()
-        );
-
-        // In user namespaces (rootless), xattrs must be stored in the
-        // user.* namespace instead of trusted.*, which requires the
-        // userxattr mount option (Linux 5.11+).
-        if rootless {
-            options.push_str(",userxattr");
-        }
-
-        mount(
-            Some("overlay"),
-            merged,
-            Some("overlay"),
-            MsFlags::empty(),
-            Some(options.as_str()),
-        )
-        .map_err(|e| SandboxError::OverlaySetup(format!("kernel overlay mount failed: {e}")))
-    }
-
-    fn try_fuse_overlayfs(
-        merged: &Path,
-        upper: &Path,
-        work: &Path,
-        lower: &Path,
-    ) -> Result<(), SandboxError> {
-        let options = format!(
-            "lowerdir={},upperdir={},workdir={}",
-            lower.display(),
-            upper.display(),
-            work.display()
-        );
-
-        let output = std::process::Command::new("fuse-overlayfs")
-            .arg("-o")
-            .arg(&options)
-            .arg(merged)
-            .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    SandboxError::OverlaySetup(
-                        "fuse-overlayfs binary not found. \
-                         Install it with: apt install fuse-overlayfs (Debian/Ubuntu) \
-                         or dnf install fuse-overlayfs (Fedora/RHEL)"
-                            .to_string(),
-                    )
-                } else {
-                    SandboxError::OverlaySetup(format!("failed to execute fuse-overlayfs: {e}"))
-                }
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::OverlaySetup(format!(
-                "fuse-overlayfs exited with {}: {}",
-                output.status,
-                stderr.trim()
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// Unmount an overlay filesystem.
-    pub fn unmount_overlay(merged: &Path, active: &ActiveOverlay) -> Result<(), SandboxError> {
-        match active {
-            ActiveOverlay::KernelOverlay => {
-                umount2(merged, MntFlags::MNT_DETACH).map_err(|e| {
-                    SandboxError::OverlaySetup(format!("failed to unmount kernel overlay: {e}"))
-                })
-            }
-            ActiveOverlay::FuseOverlayfs => unmount_fuse_overlay(merged),
-            ActiveOverlay::Stub => Ok(()),
-        }
-    }
-
-    fn unmount_fuse_overlay(merged: &Path) -> Result<(), SandboxError> {
-        // Prefer umount2 (works inside our mount namespace for FUSE mounts)
-        if umount2(merged, MntFlags::MNT_DETACH).is_ok() {
-            return Ok(());
-        }
-
-        // Fall back to fusermount3 / fusermount
-        for cmd in ["fusermount3", "fusermount"] {
-            if let Ok(status) = std::process::Command::new(cmd)
-                .arg("-u")
-                .arg(merged)
-                .status()
-            {
-                if status.success() {
-                    return Ok(());
-                }
-            }
-        }
-
-        Err(SandboxError::OverlaySetup(format!(
-            "failed to unmount fuse-overlayfs at {}",
-            merged.display()
-        )))
-    }
-
-    // -----------------------------------------------------------------------
-    // Two-phase mount setup
-    //
-    // Phase 1 (setup_dev_mounts): BEFORE pivot_root, while host /dev/* is
-    //   still accessible.  Creates a tmpfs at {new_root}/dev and bind-mounts
-    //   host device nodes into it, avoiding mknod (which requires CAP_MKNOD
-    //   and fails inside user namespaces).
-    //
-    // Phase 2 (setup_post_pivot_mounts): AFTER pivot_root.  Mounts /proc,
-    //   /sys, /dev/pts, /dev/shm, /tmp.  Non-critical mounts (/sys, /dev/pts)
-    //   are best-effort so the sandbox still starts in restricted environments.
-    // -----------------------------------------------------------------------
-
-    /// Phase 1: Mount /dev before pivot_root.
-    ///
-    /// Must be called BEFORE `pivot_root` while host `/dev/*` nodes are still
-    /// reachable, so we can bind-mount them into the sandbox instead of using
-    /// `mknod` (which requires `CAP_MKNOD`).
-    pub fn setup_dev_mounts(new_root: &Path) -> Result<(), SandboxError> {
-        let dev_path = new_root.join("dev");
-        std::fs::create_dir_all(&dev_path).ok();
-
-        mount(
-            Some("tmpfs"),
-            &dev_path,
-            Some("tmpfs"),
-            MsFlags::MS_NOSUID | MsFlags::MS_STRICTATIME,
-            Some("mode=755,size=65536k"),
-        )
-        .map_err(|e| SandboxError::OverlaySetup(format!("failed to mount tmpfs on /dev: {e}")))?;
-
-        bind_or_create_device_nodes(&dev_path);
-        create_dev_symlinks(&dev_path);
-
-        Ok(())
-    }
-
-    /// Phase 2: Mount pseudo-filesystems after pivot_root.
-    ///
-    /// `/dev` is already set up by [`setup_dev_mounts`].
-    /// Non-critical mounts are best-effort with per-mount diagnostics.
-    pub fn setup_post_pivot_mounts(root: &Path) -> Result<(), SandboxError> {
-        // /proc — critical for nearly every program
-        let proc_path = root.join("proc");
-        std::fs::create_dir_all(&proc_path).ok();
-        mount(
-            Some("proc"),
-            &proc_path,
-            Some("proc"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-            None::<&str>,
-        )
-        .map_err(|e| SandboxError::OverlaySetup(format!("failed to mount /proc: {e}")))?;
-
-        // /sys — best-effort; some user namespace configs deny sysfs
-        let sys_path = root.join("sys");
-        std::fs::create_dir_all(&sys_path).ok();
-        if let Err(e) = mount(
-            Some("sysfs"),
-            &sys_path,
-            Some("sysfs"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_RDONLY,
-            None::<&str>,
-        ) {
-            tracing::warn!("sysfs mount failed ({e}); /sys will be unavailable");
-        }
-
-        // /dev/pts — best-effort; devpts may be denied in user namespaces
-        let pts_path = root.join("dev/pts");
-        std::fs::create_dir_all(&pts_path).ok();
-        if let Err(e) = mount(
-            Some("devpts"),
-            &pts_path,
-            Some("devpts"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
-            Some("newinstance,ptmxmode=0666,mode=620"),
-        ) {
-            tracing::warn!("devpts mount failed ({e}); PTY allocation unavailable");
-        }
-
-        // /dev/shm
-        let shm_path = root.join("dev/shm");
-        std::fs::create_dir_all(&shm_path).ok();
-        if let Err(e) = mount(
-            Some("tmpfs"),
-            &shm_path,
-            Some("tmpfs"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-            Some("mode=1777,size=65536k"),
-        ) {
-            tracing::warn!("failed to mount /dev/shm ({e})");
-        }
-
-        // /tmp
-        let tmp_path = root.join("tmp");
-        std::fs::create_dir_all(&tmp_path).ok();
-        mount(
-            Some("tmpfs"),
-            &tmp_path,
-            Some("tmpfs"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_STRICTATIME,
-            Some("mode=1777,size=1g"),
-        )
-        .map_err(|e| SandboxError::OverlaySetup(format!("failed to mount /tmp: {e}")))
-    }
-
-    /// Bind-mount host device nodes, falling back to mknod if bind-mount
-    /// fails. Silently skips devices that cannot be created by either method.
-    fn bind_or_create_device_nodes(dev_path: &Path) {
-        let devices: &[(&str, u64, u64)] = &[
-            ("null", 1, 3),
-            ("zero", 1, 5),
-            ("full", 1, 7),
-            ("random", 1, 8),
-            ("urandom", 1, 9),
-            ("tty", 5, 0),
-        ];
-
-        for &(name, major, minor) in devices {
-            let host_path = Path::new("/dev").join(name);
-            let target = dev_path.join(name);
-
-            // Create an empty regular file as the bind-mount target
-            if std::fs::File::create(&target).is_err() {
-                tracing::warn!("cannot create mount point for /dev/{name}");
-                continue;
-            }
-
-            // Strategy 1: bind-mount from host (works without CAP_MKNOD)
-            if host_path.exists() {
-                if mount(
-                    Some(&*host_path),
-                    &target,
-                    None::<&str>,
-                    MsFlags::MS_BIND,
-                    None::<&str>,
-                )
-                .is_ok()
-                {
-                    continue;
-                }
-            }
-
-            // Strategy 2: mknod (needs CAP_MKNOD — works when running as
-            // real root, but not inside a user namespace)
-            use nix::sys::stat::{makedev, mknod, Mode, SFlag};
-            let _ = std::fs::remove_file(&target);
-            let dev = makedev(major, minor);
-            if mknod(
-                &target,
-                SFlag::S_IFCHR,
-                Mode::from_bits_truncate(0o666),
-                dev,
-            )
-            .is_err()
-            {
-                tracing::warn!(
-                    "/dev/{name} unavailable (bind-mount and mknod both failed)"
-                );
-            }
-        }
-    }
-
-    fn create_dev_symlinks(dev_path: &Path) {
-        use std::os::unix::fs::symlink;
-
-        let symlinks = [
-            ("stdin", "/proc/self/fd/0"),
-            ("stdout", "/proc/self/fd/1"),
-            ("stderr", "/proc/self/fd/2"),
-            ("fd", "/proc/self/fd"),
-        ];
-
-        for (name, target) in symlinks {
-            let path = dev_path.join(name);
-            let _ = symlink(target, &path);
-        }
-
-        let _ = symlink("pts/ptmx", dev_path.join("ptmx"));
-    }
-
-    fn create_overlay_dirs(upper: &Path, work: &Path, merged: &Path) -> Result<(), SandboxError> {
-        std::fs::create_dir_all(upper)
-            .map_err(|e| SandboxError::OverlaySetup(format!("failed to create upper dir: {e}")))?;
-        std::fs::create_dir_all(work)
-            .map_err(|e| SandboxError::OverlaySetup(format!("failed to create work dir: {e}")))?;
-        std::fs::create_dir_all(merged)
-            .map_err(|e| SandboxError::OverlaySetup(format!("failed to create merged dir: {e}")))?;
-        Ok(())
-    }
-}
-
-// Re-export Linux implementations
-#[cfg(target_os = "linux")]
-pub use linux_impl::*;
-
-// ---------------------------------------------------------------------------
-// Non-Linux stubs
-// ---------------------------------------------------------------------------
-#[cfg(not(target_os = "linux"))]
+/// Setup an OverlayFS mount using the configured driver strategy.
+///
+/// Returns the [`ActiveOverlay`] variant that was successfully used,
+/// so callers can pass it to [`unmount_overlay`] later.
 pub fn setup_overlay(
     merged: &Path,
     upper: &Path,
     work: &Path,
     lower: &Path,
-    _driver: &OverlayDriver,
+    driver: &OverlayDriver,
 ) -> Result<ActiveOverlay, SandboxError> {
-    std::fs::create_dir_all(upper)
-        .map_err(|e| SandboxError::OverlaySetup(format!("failed to create upper dir: {e}")))?;
-    std::fs::create_dir_all(work)
-        .map_err(|e| SandboxError::OverlaySetup(format!("failed to create work dir: {e}")))?;
-    std::fs::create_dir_all(merged)
-        .map_err(|e| SandboxError::OverlaySetup(format!("failed to create merged dir: {e}")))?;
+    create_overlay_dirs(upper, work, merged)?;
 
     if !lower.exists() {
         return Err(SandboxError::OverlaySetup(format!(
@@ -456,24 +69,349 @@ pub fn setup_overlay(
         )));
     }
 
-    tracing::warn!("OverlayFS is only available on Linux; using stub implementation");
-    Ok(ActiveOverlay::Stub)
+    let rootless = namespace::is_rootless_mode();
+
+    match driver {
+        OverlayDriver::Auto => {
+            match try_kernel_overlay(merged, upper, work, lower, rootless) {
+                Ok(()) => {
+                    tracing::info!("Using kernel overlayfs");
+                    Ok(ActiveOverlay::KernelOverlay)
+                }
+                Err(kernel_err) => {
+                    tracing::warn!(
+                        %kernel_err,
+                        "Kernel overlay mount failed; trying fuse-overlayfs"
+                    );
+                    try_fuse_overlayfs(merged, upper, work, lower).map_err(|fuse_err| {
+                        SandboxError::OverlaySetup(format!(
+                            "All overlay drivers failed.\n\
+                             Kernel overlay: {kernel_err}\n\
+                             fuse-overlayfs: {fuse_err}\n\n\
+                             Possible fixes:\n\
+                             - Install fuse-overlayfs: apt install fuse-overlayfs (Debian/Ubuntu) \
+                               or dnf install fuse-overlayfs (Fedora/RHEL)\n\
+                             - Use a kernel >= 5.11 with unprivileged overlay support\n\
+                             - Check AppArmor/SELinux policies that may block overlay mounts\n\
+                             - Run as root (not recommended)"
+                        ))
+                    })?;
+                    tracing::info!("Using fuse-overlayfs (kernel overlay unavailable)");
+                    Ok(ActiveOverlay::FuseOverlayfs)
+                }
+            }
+        }
+        OverlayDriver::KernelOverlay => {
+            try_kernel_overlay(merged, upper, work, lower, rootless)?;
+            tracing::info!("Using kernel overlayfs (forced)");
+            Ok(ActiveOverlay::KernelOverlay)
+        }
+        OverlayDriver::FuseOverlayfs => {
+            try_fuse_overlayfs(merged, upper, work, lower)?;
+            tracing::info!("Using fuse-overlayfs (forced)");
+            Ok(ActiveOverlay::FuseOverlayfs)
+        }
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn unmount_overlay(_merged: &Path, _active: &ActiveOverlay) -> Result<(), SandboxError> {
+fn try_kernel_overlay(
+    merged: &Path,
+    upper: &Path,
+    work: &Path,
+    lower: &Path,
+    rootless: bool,
+) -> Result<(), SandboxError> {
+    let mut options = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lower.display(),
+        upper.display(),
+        work.display()
+    );
+
+    // In user namespaces (rootless), xattrs must be stored in the
+    // user.* namespace instead of trusted.*, which requires the
+    // userxattr mount option (Linux 5.11+).
+    if rootless {
+        options.push_str(",userxattr");
+    }
+
+    mount(
+        Some("overlay"),
+        merged,
+        Some("overlay"),
+        MsFlags::empty(),
+        Some(options.as_str()),
+    )
+    .map_err(|e| SandboxError::OverlaySetup(format!("kernel overlay mount failed: {e}")))
+}
+
+fn try_fuse_overlayfs(
+    merged: &Path,
+    upper: &Path,
+    work: &Path,
+    lower: &Path,
+) -> Result<(), SandboxError> {
+    let options = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lower.display(),
+        upper.display(),
+        work.display()
+    );
+
+    let output = std::process::Command::new("fuse-overlayfs")
+        .arg("-o")
+        .arg(&options)
+        .arg(merged)
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                SandboxError::OverlaySetup(
+                    "fuse-overlayfs binary not found. \
+                     Install it with: apt install fuse-overlayfs (Debian/Ubuntu) \
+                     or dnf install fuse-overlayfs (Fedora/RHEL)"
+                        .to_string(),
+                )
+            } else {
+                SandboxError::OverlaySetup(format!("failed to execute fuse-overlayfs: {e}"))
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SandboxError::OverlaySetup(format!(
+            "fuse-overlayfs exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn setup_dev_mounts(_new_root: &Path) -> Result<(), SandboxError> {
-    tracing::warn!("Device mounts are only available on Linux");
+/// Unmount an overlay filesystem.
+pub fn unmount_overlay(merged: &Path, active: &ActiveOverlay) -> Result<(), SandboxError> {
+    match active {
+        ActiveOverlay::KernelOverlay => {
+            umount2(merged, MntFlags::MNT_DETACH).map_err(|e| {
+                SandboxError::OverlaySetup(format!("failed to unmount kernel overlay: {e}"))
+            })
+        }
+        ActiveOverlay::FuseOverlayfs => unmount_fuse_overlay(merged),
+    }
+}
+
+fn unmount_fuse_overlay(merged: &Path) -> Result<(), SandboxError> {
+    // Prefer umount2 (works inside our mount namespace for FUSE mounts)
+    if umount2(merged, MntFlags::MNT_DETACH).is_ok() {
+        return Ok(());
+    }
+
+    // Fall back to fusermount3 / fusermount
+    for cmd in ["fusermount3", "fusermount"] {
+        if let Ok(status) = std::process::Command::new(cmd)
+            .arg("-u")
+            .arg(merged)
+            .status()
+        {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(SandboxError::OverlaySetup(format!(
+        "failed to unmount fuse-overlayfs at {}",
+        merged.display()
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Two-phase mount setup
+//
+// Phase 1 (setup_dev_mounts): BEFORE pivot_root, while host /dev/* is
+//   still accessible.  Creates a tmpfs at {new_root}/dev and bind-mounts
+//   host device nodes into it, avoiding mknod (which requires CAP_MKNOD
+//   and fails inside user namespaces).
+//
+// Phase 2 (setup_post_pivot_mounts): AFTER pivot_root.  Mounts /proc,
+//   /sys, /dev/pts, /dev/shm, /tmp.  Non-critical mounts (/sys, /dev/pts)
+//   are best-effort so the sandbox still starts in restricted environments.
+// ---------------------------------------------------------------------------
+
+/// Phase 1: Mount /dev before pivot_root.
+///
+/// Must be called BEFORE `pivot_root` while host `/dev/*` nodes are still
+/// reachable, so we can bind-mount them into the sandbox instead of using
+/// `mknod` (which requires `CAP_MKNOD`).
+pub fn setup_dev_mounts(new_root: &Path) -> Result<(), SandboxError> {
+    let dev_path = new_root.join("dev");
+    std::fs::create_dir_all(&dev_path).ok();
+
+    mount(
+        Some("tmpfs"),
+        &dev_path,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_STRICTATIME,
+        Some("mode=755,size=65536k"),
+    )
+    .map_err(|e| SandboxError::OverlaySetup(format!("failed to mount tmpfs on /dev: {e}")))?;
+
+    bind_or_create_device_nodes(&dev_path);
+    create_dev_symlinks(&dev_path);
+
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn setup_post_pivot_mounts(_root: &Path) -> Result<(), SandboxError> {
-    tracing::warn!("Pseudo-filesystem mounts are only available on Linux");
+/// Phase 2: Mount pseudo-filesystems after pivot_root.
+///
+/// `/dev` is already set up by [`setup_dev_mounts`].
+/// Non-critical mounts are best-effort with per-mount diagnostics.
+pub fn setup_post_pivot_mounts(root: &Path) -> Result<(), SandboxError> {
+    // /proc — critical for nearly every program
+    let proc_path = root.join("proc");
+    std::fs::create_dir_all(&proc_path).ok();
+    mount(
+        Some("proc"),
+        &proc_path,
+        Some("proc"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    )
+    .map_err(|e| SandboxError::OverlaySetup(format!("failed to mount /proc: {e}")))?;
+
+    // /sys — best-effort; some user namespace configs deny sysfs
+    let sys_path = root.join("sys");
+    std::fs::create_dir_all(&sys_path).ok();
+    if let Err(e) = mount(
+        Some("sysfs"),
+        &sys_path,
+        Some("sysfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_RDONLY,
+        None::<&str>,
+    ) {
+        tracing::warn!("sysfs mount failed ({e}); /sys will be unavailable");
+    }
+
+    // /dev/pts — best-effort; devpts may be denied in user namespaces
+    let pts_path = root.join("dev/pts");
+    std::fs::create_dir_all(&pts_path).ok();
+    if let Err(e) = mount(
+        Some("devpts"),
+        &pts_path,
+        Some("devpts"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+        Some("newinstance,ptmxmode=0666,mode=620"),
+    ) {
+        tracing::warn!("devpts mount failed ({e}); PTY allocation unavailable");
+    }
+
+    // /dev/shm
+    let shm_path = root.join("dev/shm");
+    std::fs::create_dir_all(&shm_path).ok();
+    if let Err(e) = mount(
+        Some("tmpfs"),
+        &shm_path,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        Some("mode=1777,size=65536k"),
+    ) {
+        tracing::warn!("failed to mount /dev/shm ({e})");
+    }
+
+    // /tmp
+    let tmp_path = root.join("tmp");
+    std::fs::create_dir_all(&tmp_path).ok();
+    mount(
+        Some("tmpfs"),
+        &tmp_path,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_STRICTATIME,
+        Some("mode=1777,size=1g"),
+    )
+    .map_err(|e| SandboxError::OverlaySetup(format!("failed to mount /tmp: {e}")))
+}
+
+/// Bind-mount host device nodes, falling back to mknod if bind-mount
+/// fails. Silently skips devices that cannot be created by either method.
+fn bind_or_create_device_nodes(dev_path: &Path) {
+    let devices: &[(&str, u64, u64)] = &[
+        ("null", 1, 3),
+        ("zero", 1, 5),
+        ("full", 1, 7),
+        ("random", 1, 8),
+        ("urandom", 1, 9),
+        ("tty", 5, 0),
+    ];
+
+    for &(name, major, minor) in devices {
+        let host_path = Path::new("/dev").join(name);
+        let target = dev_path.join(name);
+
+        if std::fs::File::create(&target).is_err() {
+            tracing::warn!("cannot create mount point for /dev/{name}");
+            continue;
+        }
+
+        // Strategy 1: bind-mount from host (works without CAP_MKNOD)
+        if host_path.exists() {
+            if mount(
+                Some(&*host_path),
+                &target,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .is_ok()
+            {
+                continue;
+            }
+        }
+
+        // Strategy 2: mknod (needs CAP_MKNOD — works when running as
+        // real root, but not inside a user namespace)
+        use nix::sys::stat::{makedev, mknod, Mode, SFlag};
+        let _ = std::fs::remove_file(&target);
+        let dev = makedev(major, minor);
+        if mknod(
+            &target,
+            SFlag::S_IFCHR,
+            Mode::from_bits_truncate(0o666),
+            dev,
+        )
+        .is_err()
+        {
+            tracing::warn!(
+                "/dev/{name} unavailable (bind-mount and mknod both failed)"
+            );
+        }
+    }
+}
+
+fn create_dev_symlinks(dev_path: &Path) {
+    use std::os::unix::fs::symlink;
+
+    let symlinks = [
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+        ("fd", "/proc/self/fd"),
+    ];
+
+    for (name, target) in symlinks {
+        let path = dev_path.join(name);
+        let _ = symlink(target, &path);
+    }
+
+    let _ = symlink("pts/ptmx", dev_path.join("ptmx"));
+}
+
+fn create_overlay_dirs(upper: &Path, work: &Path, merged: &Path) -> Result<(), SandboxError> {
+    std::fs::create_dir_all(upper)
+        .map_err(|e| SandboxError::OverlaySetup(format!("failed to create upper dir: {e}")))?;
+    std::fs::create_dir_all(work)
+        .map_err(|e| SandboxError::OverlaySetup(format!("failed to create work dir: {e}")))?;
+    std::fs::create_dir_all(merged)
+        .map_err(|e| SandboxError::OverlaySetup(format!("failed to create merged dir: {e}")))?;
     Ok(())
 }
 

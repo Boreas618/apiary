@@ -2,16 +2,11 @@
 //!
 //! This module provides seccomp BPF filters to restrict network access
 //! and other potentially dangerous syscalls within sandboxes.
-//!
-//! Note: This module is only functional on Linux. On other platforms,
-//! the functions are stubs that return errors.
 
-#[cfg(target_os = "linux")]
 use seccompiler::{
     apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
     SeccompFilter, SeccompRule, TargetArch,
 };
-#[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 
 use super::SandboxError;
@@ -21,7 +16,6 @@ use crate::config::SeccompPolicy;
 ///
 /// This should be called after fork() but before exec() in the child process.
 /// Once applied, the filter cannot be removed or relaxed.
-#[cfg(target_os = "linux")]
 pub fn apply_seccomp_filter(policy: &SeccompPolicy) -> Result<(), SandboxError> {
     let filter = build_filter(policy)?;
     let prog: BpfProgram = filter.try_into().map_err(|e| {
@@ -34,16 +28,6 @@ pub fn apply_seccomp_filter(policy: &SeccompPolicy) -> Result<(), SandboxError> 
     Ok(())
 }
 
-/// Apply seccomp filter to the current thread (non-Linux stub).
-#[cfg(not(target_os = "linux"))]
-pub fn apply_seccomp_filter(_policy: &SeccompPolicy) -> Result<(), SandboxError> {
-    Err(SandboxError::SeccompFilter(
-        "seccomp is only available on Linux".to_string(),
-    ))
-}
-
-/// Build a seccomp filter based on the policy.
-#[cfg(target_os = "linux")]
 fn build_filter(policy: &SeccompPolicy) -> Result<SeccompFilter, SandboxError> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
@@ -74,8 +58,6 @@ fn build_filter(policy: &SeccompPolicy) -> Result<SeccompFilter, SandboxError> {
     Ok(filter)
 }
 
-/// Add rules to block network-related syscalls.
-#[cfg(target_os = "linux")]
 fn add_network_blocking_rules(
     rules: &mut BTreeMap<i64, Vec<SeccompRule>>,
     allow_unix_sockets: bool,
@@ -129,8 +111,6 @@ fn add_network_blocking_rules(
     Ok(())
 }
 
-/// Get the target architecture for seccomp.
-#[cfg(target_os = "linux")]
 fn target_arch() -> TargetArch {
     #[cfg(target_arch = "x86_64")]
     {
@@ -146,8 +126,6 @@ fn target_arch() -> TargetArch {
     }
 }
 
-/// Get the syscall number for a syscall name.
-#[cfg(target_os = "linux")]
 fn syscall_number(name: &str) -> Option<i64> {
     match name.to_lowercase().as_str() {
         "socket" => Some(libc::SYS_socket),
@@ -189,7 +167,6 @@ fn syscall_number(name: &str) -> Option<i64> {
 /// Set PR_SET_NO_NEW_PRIVS to prevent privilege escalation.
 ///
 /// This must be called before applying seccomp filters in non-root context.
-#[cfg(target_os = "linux")]
 pub fn set_no_new_privs() -> Result<(), SandboxError> {
     let result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if result != 0 {
@@ -199,14 +176,6 @@ pub fn set_no_new_privs() -> Result<(), SandboxError> {
         )));
     }
     Ok(())
-}
-
-/// Set PR_SET_NO_NEW_PRIVS (non-Linux stub).
-#[cfg(not(target_os = "linux"))]
-pub fn set_no_new_privs() -> Result<(), SandboxError> {
-    Err(SandboxError::SeccompFilter(
-        "PR_SET_NO_NEW_PRIVS is only available on Linux".to_string(),
-    ))
 }
 
 /// A predefined strict seccomp policy that blocks most dangerous operations.
@@ -242,7 +211,6 @@ pub fn network_only_policy() -> SeccompPolicy {
 }
 
 /// Check if seccomp is available on this system.
-#[cfg(target_os = "linux")]
 pub fn is_seccomp_available() -> bool {
     // Try to check if seccomp is available by querying the kernel
     let result = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) };
@@ -250,17 +218,10 @@ pub fn is_seccomp_available() -> bool {
     result >= 0
 }
 
-/// Check if seccomp is available (non-Linux always returns false).
-#[cfg(not(target_os = "linux"))]
-pub fn is_seccomp_available() -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_syscall_number() {
         assert_eq!(syscall_number("socket"), Some(libc::SYS_socket));
@@ -268,7 +229,6 @@ mod tests {
         assert_eq!(syscall_number("unknown"), None);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_target_arch() {
         let arch = target_arch();
@@ -296,7 +256,6 @@ mod tests {
 
     #[test]
     fn test_seccomp_available() {
-        // Just test that the function doesn't panic
         let _ = is_seccomp_available();
     }
 }

@@ -10,8 +10,25 @@ use crate::sandbox::overlay::OverlayDriver;
 /// Main configuration for the sandbox pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolConfig {
-    /// Number of sandboxes in the pool.
-    pub pool_size: usize,
+    /// Minimum number of sandboxes (created at startup, never scaled below).
+    #[serde(default = "default_min_sandboxes")]
+    pub min_sandboxes: usize,
+
+    /// Maximum number of sandboxes (hard ceiling for auto-scaling).
+    #[serde(default = "default_max_sandboxes")]
+    pub max_sandboxes: usize,
+
+    /// Number of sandboxes to create per scale-up event.
+    #[serde(default = "default_scale_up_step")]
+    pub scale_up_step: usize,
+
+    /// How long an excess sandbox (above min) can be idle before removal.
+    #[serde(default = "default_idle_timeout", with = "duration_string_serde")]
+    pub idle_timeout: Duration,
+
+    /// Minimum interval between scaling events to prevent thrashing.
+    #[serde(default = "default_cooldown", with = "cooldown_serde")]
+    pub cooldown: Duration,
 
     /// Path to the base rootfs image (lower layer for OverlayFS).
     pub base_image: PathBuf,
@@ -36,7 +53,7 @@ pub struct PoolConfig {
     pub seccomp_policy: SeccompPolicy,
 
     /// Default timeout for tasks.
-    #[serde(default = "default_timeout", with = "duration_string_serde")]
+    #[serde(default = "default_timeout", with = "task_timeout_serde")]
     pub default_timeout: Duration,
 
     /// Default working directory inside sandbox.
@@ -46,6 +63,26 @@ pub struct PoolConfig {
     /// Default environment variables for all tasks.
     #[serde(default)]
     pub default_env: HashMap<String, String>,
+}
+
+fn default_min_sandboxes() -> usize {
+    10
+}
+
+fn default_max_sandboxes() -> usize {
+    40
+}
+
+fn default_scale_up_step() -> usize {
+    2
+}
+
+fn default_idle_timeout() -> Duration {
+    Duration::from_secs(300)
+}
+
+fn default_cooldown() -> Duration {
+    Duration::from_secs(30)
 }
 
 fn default_timeout() -> Duration {
@@ -59,7 +96,11 @@ fn default_workdir() -> PathBuf {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            pool_size: 10,
+            min_sandboxes: default_min_sandboxes(),
+            max_sandboxes: default_max_sandboxes(),
+            scale_up_step: default_scale_up_step(),
+            idle_timeout: default_idle_timeout(),
+            cooldown: default_cooldown(),
             base_image: PathBuf::from("./rootfs"),
             overlay_dir: PathBuf::from("./overlays"),
             overlay_driver: OverlayDriver::default(),
@@ -158,7 +199,11 @@ impl Default for SeccompPolicy {
 /// Builder for PoolConfig.
 #[derive(Debug, Default)]
 pub struct PoolConfigBuilder {
-    pool_size: Option<usize>,
+    min_sandboxes: Option<usize>,
+    max_sandboxes: Option<usize>,
+    scale_up_step: Option<usize>,
+    idle_timeout: Option<Duration>,
+    cooldown: Option<Duration>,
     base_image: Option<PathBuf>,
     overlay_dir: Option<PathBuf>,
     overlay_driver: Option<OverlayDriver>,
@@ -171,8 +216,28 @@ pub struct PoolConfigBuilder {
 }
 
 impl PoolConfigBuilder {
-    pub fn pool_size(mut self, size: usize) -> Self {
-        self.pool_size = Some(size);
+    pub fn min_sandboxes(mut self, n: usize) -> Self {
+        self.min_sandboxes = Some(n);
+        self
+    }
+
+    pub fn max_sandboxes(mut self, n: usize) -> Self {
+        self.max_sandboxes = Some(n);
+        self
+    }
+
+    pub fn scale_up_step(mut self, n: usize) -> Self {
+        self.scale_up_step = Some(n);
+        self
+    }
+
+    pub fn idle_timeout(mut self, d: Duration) -> Self {
+        self.idle_timeout = Some(d);
+        self
+    }
+
+    pub fn cooldown(mut self, d: Duration) -> Self {
+        self.cooldown = Some(d);
         self
     }
 
@@ -228,13 +293,24 @@ impl PoolConfigBuilder {
             .base_image
             .ok_or_else(|| anyhow::anyhow!("base_image is required"))?;
 
-        let pool_size = self.pool_size.unwrap_or(10);
-        if pool_size == 0 {
-            anyhow::bail!("pool_size must be at least 1");
+        let min_sandboxes = self.min_sandboxes.unwrap_or_else(default_min_sandboxes);
+        if min_sandboxes == 0 {
+            anyhow::bail!("min_sandboxes must be at least 1");
+        }
+
+        let max_sandboxes = self.max_sandboxes.unwrap_or_else(default_max_sandboxes);
+        if max_sandboxes < min_sandboxes {
+            anyhow::bail!(
+                "max_sandboxes ({max_sandboxes}) must be >= min_sandboxes ({min_sandboxes})"
+            );
         }
 
         Ok(PoolConfig {
-            pool_size,
+            min_sandboxes,
+            max_sandboxes,
+            scale_up_step: self.scale_up_step.unwrap_or_else(default_scale_up_step),
+            idle_timeout: self.idle_timeout.unwrap_or_else(default_idle_timeout),
+            cooldown: self.cooldown.unwrap_or_else(default_cooldown),
             base_image,
             overlay_dir: self
                 .overlay_dir
@@ -250,46 +326,60 @@ impl PoolConfigBuilder {
     }
 }
 
+pub fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let secs = duration.as_secs();
+    if secs >= 3600 && secs % 3600 == 0 {
+        serializer.serialize_str(&format!("{}h", secs / 3600))
+    } else if secs >= 60 && secs % 60 == 0 {
+        serializer.serialize_str(&format!("{}m", secs / 60))
+    } else {
+        serializer.serialize_str(&format!("{secs}s"))
+    }
+}
+
+pub fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    parse_duration(&s).map_err(serde::de::Error::custom)
+}
+
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    if let Some(num) = s.strip_suffix('s') {
+        num.trim()
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|e| e.to_string())
+    } else if let Some(num) = s.strip_suffix('m') {
+        num.trim()
+            .parse::<u64>()
+            .map(|m| Duration::from_secs(m * 60))
+            .map_err(|e| e.to_string())
+    } else if let Some(num) = s.strip_suffix('h') {
+        num.trim()
+            .parse::<u64>()
+            .map(|h| Duration::from_secs(h * 3600))
+            .map_err(|e| e.to_string())
+    } else {
+        s.parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|e| e.to_string())
+    }
+}
+
 mod duration_string_serde {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use std::time::Duration;
+    pub use super::{deserialize_duration as deserialize, serialize_duration as serialize};
+}
 
-    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&format!("{}s", duration.as_secs()))
-    }
+mod cooldown_serde {
+    pub use super::{deserialize_duration as deserialize, serialize_duration as serialize};
+}
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        parse_duration(&s).map_err(serde::de::Error::custom)
-    }
-
-    fn parse_duration(s: &str) -> Result<Duration, String> {
-        let s = s.trim();
-        if let Some(num) = s.strip_suffix('s') {
-            num.trim()
-                .parse::<u64>()
-                .map(Duration::from_secs)
-                .map_err(|e| e.to_string())
-        } else if let Some(num) = s.strip_suffix('m') {
-            num.trim()
-                .parse::<u64>()
-                .map(|m| Duration::from_secs(m * 60))
-                .map_err(|e| e.to_string())
-        } else if let Some(num) = s.strip_suffix('h') {
-            num.trim()
-                .parse::<u64>()
-                .map(|h| Duration::from_secs(h * 3600))
-                .map_err(|e| e.to_string())
-        } else {
-            s.parse::<u64>()
-                .map(Duration::from_secs)
-                .map_err(|e| e.to_string())
-        }
-    }
+mod task_timeout_serde {
+    pub use super::{deserialize_duration as deserialize, serialize_duration as serialize};
 }

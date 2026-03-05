@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use apiary::{Pool, PoolConfig, PoolError, Task};
@@ -12,7 +11,11 @@ use crate::api::server;
 /// Initialize the sandbox pool.
 pub async fn init_pool(
     base_image: PathBuf,
-    pool_size: usize,
+    min_sandboxes: usize,
+    max_sandboxes: usize,
+    scale_up_step: usize,
+    idle_timeout: Duration,
+    cooldown: Duration,
     overlay_dir: Option<PathBuf>,
     config_path: Option<PathBuf>,
     enable_seccomp: bool,
@@ -26,7 +29,11 @@ pub async fn init_pool(
     let overlay_dir = overlay_dir.unwrap_or_else(PoolConfig::default_overlay_dir);
 
     let config = PoolConfig::builder()
-        .pool_size(pool_size)
+        .min_sandboxes(min_sandboxes)
+        .max_sandboxes(max_sandboxes)
+        .scale_up_step(scale_up_step)
+        .idle_timeout(idle_timeout)
+        .cooldown(cooldown)
         .base_image(&base_image)
         .overlay_dir(&overlay_dir)
         .enable_seccomp(enable_seccomp)
@@ -48,8 +55,10 @@ pub async fn init_pool(
     let status = pool.status();
 
     println!("Pool initialized successfully!");
-    println!("  Total sandboxes: {}", status.total);
-    println!("  Idle sandboxes: {}", status.idle);
+    println!("  Sandboxes: {} (min={}, max={})", status.total, status.min_sandboxes, status.max_sandboxes);
+    println!("  Scale-up step: {scale_up_step}");
+    println!("  Idle timeout: {idle_timeout:?}");
+    println!("  Cooldown: {cooldown:?}");
     println!("  Seccomp: {}", if enable_seccomp { "enabled" } else { "disabled" });
     println!("  Config file: {}", config_file.display());
     println!("  Overlay dir: {}", overlay_dir.display());
@@ -80,7 +89,7 @@ pub async fn run_daemon(
     }
     tracing::info!("Loaded config from: {}", config_file.display());
 
-    let pool = Arc::new(Pool::new(config).await?);
+    let pool = Pool::new(config).await?;
     tracing::info!("Pool initialized with {} sandboxes", pool.status().total);
     tracing::info!("Starting daemon API server (bind address: {bind})");
 
@@ -227,7 +236,8 @@ pub async fn run_batch(
     }
 
     let config = PoolConfig {
-        pool_size: parallelism.min(config.pool_size),
+        min_sandboxes: parallelism.min(config.min_sandboxes),
+        max_sandboxes: parallelism.min(config.max_sandboxes),
         ..config
     };
 
@@ -240,7 +250,6 @@ pub async fn run_batch(
     tracing::info!("Running with parallelism: {parallelism} (session-only mode)");
 
     let start = std::time::Instant::now();
-    let pool = Arc::new(pool);
     let results: Vec<Result<apiary::TaskResult, PoolError>> = futures::future::join_all(
         tasks.into_iter().map(|task| {
             let pool = pool.clone();
@@ -331,7 +340,11 @@ pub async fn show_status(config_path: Option<PathBuf>) -> anyhow::Result<()> {
 
     println!("=== Sandbox Pool Configuration ===");
     println!("Config file: {}", config_file.display());
-    println!("Pool size: {}", config.pool_size);
+    println!("Min sandboxes: {}", config.min_sandboxes);
+    println!("Max sandboxes: {}", config.max_sandboxes);
+    println!("Scale-up step: {}", config.scale_up_step);
+    println!("Idle timeout: {:?}", config.idle_timeout);
+    println!("Cooldown: {:?}", config.cooldown);
     println!("Base image: {}", config.base_image.display());
     println!("Overlay dir: {}", config.overlay_dir.display());
     println!("Overlay driver: {:?}", config.overlay_driver);

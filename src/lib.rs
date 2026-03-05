@@ -19,7 +19,8 @@
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let config = PoolConfig::builder()
-//!         .pool_size(10)
+//!         .min_sandboxes(4)
+//!         .max_sandboxes(16)
 //!         .base_image("./rootfs")
 //!         .build()?;
 //!
@@ -46,4 +47,4 @@ pub use config::{PoolConfig, PoolConfigBuilder, ResourceLimits, SeccompPolicy};
 pub use pool::{Pool, PoolError};
 pub use sandbox::overlay::OverlayDriver;
 pub use sandbox::{Sandbox, SandboxError, SandboxState};
-pub use task::{MountSpec, Task, TaskOutputEvent, TaskResult};
+pub use task::{MountSpec, Task, TaskResult};

@@ -2,4 +2,4 @@
 
 mod executor;
 
-pub use executor::{MountSpec, Task, TaskBuilder, TaskOutputEvent, TaskResult};
+pub use executor::{MountSpec, Task, TaskBuilder, TaskResult};

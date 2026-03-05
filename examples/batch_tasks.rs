@@ -13,7 +13,6 @@
 //! ```
 
 use apiary::{Pool, PoolConfig, Task};
-use std::sync::Arc;
 use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
@@ -43,13 +42,14 @@ async fn async_main() -> anyhow::Result<()> {
     // Create pool configuration
     println!("Creating sandbox pool with base image: {rootfs}");
     let config = PoolConfig::builder()
-        .pool_size(4)
+        .min_sandboxes(4)
+        .max_sandboxes(16)
         .base_image(rootfs)
         .build()?;
 
     // Initialize the pool
     println!("Initializing pool...");
-    let pool = Arc::new(Pool::new(config).await?);
+    let pool = Pool::new(config).await?;
     println!("Pool ready: {} sandboxes", pool.status().total);
 
     // Create a batch of tasks

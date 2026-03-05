@@ -3,8 +3,6 @@
 //! This module provides functions to create and manage cgroups for
 //! resource limiting in sandboxes. It supports both root and rootless
 //! (delegated) cgroup operation.
-//!
-//! Note: This module is only functional on Linux.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -13,12 +11,9 @@ use std::path::{Path, PathBuf};
 use super::SandboxError;
 use crate::config::ResourceLimits;
 
-/// The base path for cgroups v2.
-#[cfg(target_os = "linux")]
 const CGROUP_V2_BASE: &str = "/sys/fs/cgroup";
 
 /// Setup a cgroup for a sandbox.
-#[cfg(target_os = "linux")]
 pub fn setup_cgroup(sandbox_id: &str, limits: &ResourceLimits) -> Result<PathBuf, SandboxError> {
     let cgroup_path = get_cgroup_path(sandbox_id)?;
     fs::create_dir_all(&cgroup_path).map_err(|e| {
@@ -45,14 +40,6 @@ pub fn setup_cgroup(sandbox_id: &str, limits: &ResourceLimits) -> Result<PathBuf
     Ok(cgroup_path)
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn setup_cgroup(_sandbox_id: &str, _limits: &ResourceLimits) -> Result<PathBuf, SandboxError> {
-    Err(SandboxError::CgroupSetup(
-        "cgroups are only available on Linux".to_string(),
-    ))
-}
-
-#[cfg(target_os = "linux")]
 fn get_cgroup_path(sandbox_id: &str) -> Result<PathBuf, SandboxError> {
     if let Ok(delegated) = find_delegated_cgroup() {
         return Ok(delegated.join("apiary").join(sandbox_id));
@@ -62,7 +49,6 @@ fn get_cgroup_path(sandbox_id: &str) -> Result<PathBuf, SandboxError> {
         .join(sandbox_id))
 }
 
-#[cfg(target_os = "linux")]
 fn find_delegated_cgroup() -> Result<PathBuf, SandboxError> {
     // Use the real uid (before user namespace), since cgroup paths
     // on the host are named after the original uid, not the mapped one.
@@ -91,7 +77,6 @@ fn find_delegated_cgroup() -> Result<PathBuf, SandboxError> {
     ))
 }
 
-#[cfg(target_os = "linux")]
 fn is_cgroup_writable(path: &Path) -> bool {
     let test_dir = path.join(".apiary-test");
     if fs::create_dir(&test_dir).is_ok() {
@@ -101,7 +86,6 @@ fn is_cgroup_writable(path: &Path) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
 fn read_current_cgroup() -> Result<String, SandboxError> {
     let content = fs::read_to_string("/proc/self/cgroup")
         .map_err(|e| SandboxError::CgroupSetup(format!("failed to read /proc/self/cgroup: {e}")))?;
@@ -117,7 +101,6 @@ fn read_current_cgroup() -> Result<String, SandboxError> {
     ))
 }
 
-#[cfg(target_os = "linux")]
 fn apply_limits(cgroup_path: &Path, limits: &ResourceLimits) -> Result<(), SandboxError> {
     let available = fs::read_to_string(cgroup_path.join("cgroup.controllers")).unwrap_or_default();
 
@@ -146,7 +129,6 @@ fn apply_limits(cgroup_path: &Path, limits: &ResourceLimits) -> Result<(), Sandb
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn write_cgroup_file(cgroup_path: &Path, filename: &str, value: &str) -> Result<(), SandboxError> {
     let file_path = cgroup_path.join(filename);
     let mut file = OpenOptions::new()
@@ -160,7 +142,6 @@ fn write_cgroup_file(cgroup_path: &Path, filename: &str, value: &str) -> Result<
     })
 }
 
-#[cfg(target_os = "linux")]
 fn read_cgroup_file(cgroup_path: &Path, filename: &str) -> Result<String, SandboxError> {
     let file_path = cgroup_path.join(filename);
     fs::read_to_string(&file_path).map_err(|e| {
@@ -169,31 +150,18 @@ fn read_cgroup_file(cgroup_path: &Path, filename: &str) -> Result<String, Sandbo
 }
 
 /// Add a process to a cgroup.
-#[cfg(target_os = "linux")]
 pub fn add_process_to_cgroup(cgroup_path: &Path, pid: u32) -> Result<(), SandboxError> {
     write_cgroup_file(cgroup_path, "cgroup.procs", &pid.to_string())
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn add_process_to_cgroup(_cgroup_path: &Path, _pid: u32) -> Result<(), SandboxError> {
-    Ok(())
-}
-
 /// Reset cgroup statistics.
-#[cfg(target_os = "linux")]
 pub fn reset_cgroup(cgroup_path: &Path) -> Result<(), SandboxError> {
     kill_cgroup_processes(cgroup_path)?;
     let _ = write_cgroup_file(cgroup_path, "memory.reclaim", "0");
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn reset_cgroup(_cgroup_path: &Path) -> Result<(), SandboxError> {
-    Ok(())
-}
-
 /// Kill all processes in a cgroup.
-#[cfg(target_os = "linux")]
 pub fn kill_cgroup_processes(cgroup_path: &Path) -> Result<(), SandboxError> {
     if write_cgroup_file(cgroup_path, "cgroup.kill", "1").is_ok() {
         return Ok(());
@@ -211,13 +179,7 @@ pub fn kill_cgroup_processes(cgroup_path: &Path) -> Result<(), SandboxError> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn kill_cgroup_processes(_cgroup_path: &Path) -> Result<(), SandboxError> {
-    Ok(())
-}
-
 /// Remove a cgroup.
-#[cfg(target_os = "linux")]
 pub fn remove_cgroup(cgroup_path: &Path) -> Result<(), SandboxError> {
     let _ = kill_cgroup_processes(cgroup_path);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -229,11 +191,6 @@ pub fn remove_cgroup(cgroup_path: &Path) -> Result<(), SandboxError> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn remove_cgroup(_cgroup_path: &Path) -> Result<(), SandboxError> {
-    Ok(())
-}
-
 /// Get cgroup statistics.
 #[derive(Debug, Default)]
 pub struct CgroupStats {
@@ -243,7 +200,6 @@ pub struct CgroupStats {
     pub cpu_usage_usec: u64,
 }
 
-#[cfg(target_os = "linux")]
 pub fn get_cgroup_stats(cgroup_path: &Path) -> Result<CgroupStats, SandboxError> {
     let mut stats = CgroupStats::default();
 
@@ -267,33 +223,16 @@ pub fn get_cgroup_stats(cgroup_path: &Path) -> Result<CgroupStats, SandboxError>
     Ok(stats)
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn get_cgroup_stats(_cgroup_path: &Path) -> Result<CgroupStats, SandboxError> {
-    Ok(CgroupStats::default())
-}
-
 /// Check if cgroups v2 is available.
-#[cfg(target_os = "linux")]
 pub fn is_cgroup_v2_available() -> bool {
     Path::new(CGROUP_V2_BASE)
         .join("cgroup.controllers")
         .exists()
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn is_cgroup_v2_available() -> bool {
-    false
-}
-
 /// Check if the current user has a delegated cgroup.
-#[cfg(target_os = "linux")]
 pub fn has_delegated_cgroup() -> bool {
     find_delegated_cgroup().is_ok()
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn has_delegated_cgroup() -> bool {
-    false
 }
 
 /// Parse a memory size string to bytes.

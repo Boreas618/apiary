@@ -6,7 +6,7 @@ pub mod overlay;
 pub mod seccomp;
 
 use crate::config::{PoolConfig, ResourceLimits, SeccompPolicy};
-use crate::task::{MountSpec, Task, TaskOutputEvent, TaskResult};
+use crate::task::{MountSpec, Task, TaskResult};
 use overlay::ActiveOverlay;
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
 
 /// Errors that can occur during sandbox operations.
 #[derive(Debug, Error)]
@@ -66,9 +65,7 @@ pub struct Sandbox {
     work_path: PathBuf,
     init_pid: Mutex<Option<nix::unistd::Pid>>,
     resource_limits: ResourceLimits,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     enable_seccomp: bool,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     seccomp_policy: SeccompPolicy,
     cgroup_path: Option<PathBuf>,
     active_overlay: Mutex<Option<ActiveOverlay>>,
@@ -168,15 +165,6 @@ impl Sandbox {
 
     /// Execute a task in this sandbox.
     pub async fn execute(&self, task: Task) -> Result<TaskResult, SandboxError> {
-        self.execute_with_events(task, None).await
-    }
-
-    /// Execute a task and optionally emit stdout/stderr chunks.
-    pub async fn execute_with_events(
-        &self,
-        task: Task,
-        output_events: Option<mpsc::UnboundedSender<TaskOutputEvent>>,
-    ) -> Result<TaskResult, SandboxError> {
         {
             let mut state = self.state.lock();
             if *state != SandboxState::Idle {
@@ -188,7 +176,7 @@ impl Sandbox {
         }
 
         let start = Instant::now();
-        let result = self.run_task_inner(&task, output_events).await;
+        let result = self.run_task_inner(&task).await;
         let duration = start.elapsed();
 
         self.stats.tasks_executed.fetch_add(1, Ordering::Relaxed);
@@ -218,7 +206,6 @@ impl Sandbox {
     async fn run_task_inner(
         &self,
         task: &Task,
-        output_events: Option<mpsc::UnboundedSender<TaskOutputEvent>>,
     ) -> Result<TaskResult, SandboxError> {
         use tokio::process::Command;
         use tokio::time::timeout;
@@ -240,8 +227,8 @@ impl Sandbox {
         let writable_mounts = task.writable_mounts.clone();
         let readonly_mounts = task.readonly_mounts.clone();
 
-        let need_stdout_pipe = task.capture_stdout || output_events.is_some();
-        let need_stderr_pipe = task.capture_stderr || output_events.is_some();
+        let need_stdout_pipe = task.capture_stdout;
+        let need_stderr_pipe = task.capture_stderr;
 
         let mut cmd = Command::new(&shell);
         cmd.args(&args)
@@ -266,7 +253,6 @@ impl Sandbox {
             cmd.stdin(std::process::Stdio::piped());
         }
 
-        #[cfg(target_os = "linux")]
         unsafe {
             cmd.pre_exec(move || {
                 configure_task_process_linux(
@@ -280,17 +266,6 @@ impl Sandbox {
                     &writable_mounts,
                     &readonly_mounts,
                 )
-            });
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        unsafe {
-            cmd.pre_exec(move || {
-                nix::unistd::chroot(&root)
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                let _ = std::fs::create_dir_all(&workdir);
-                std::env::set_current_dir(&workdir)?;
-                Ok(())
             });
         }
 
@@ -327,15 +302,11 @@ impl Sandbox {
             child.stdout.take(),
             task.capture_stdout,
             task.max_output_size,
-            output_events.clone(),
-            TaskOutputEvent::Stdout,
         ));
         let stderr_handle = tokio::spawn(read_output_stream(
             child.stderr.take(),
             task.capture_stderr,
             task.max_output_size,
-            output_events.clone(),
-            TaskOutputEvent::Stderr,
         ));
 
         let task_start = Instant::now();
@@ -384,9 +355,6 @@ impl Sandbox {
             let timeout_msg = b"Task timed out\n";
             if task.capture_stderr {
                 append_capped(&mut stderr, timeout_msg, task.max_output_size);
-            }
-            if let Some(tx) = &output_events {
-                let _ = tx.send(TaskOutputEvent::Stderr(timeout_msg.to_vec()));
             }
         }
 
@@ -459,7 +427,6 @@ impl Drop for Sandbox {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn configure_task_process_linux(
     root: &Path,
     workdir: &Path,
@@ -587,7 +554,6 @@ fn configure_task_process_linux(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn apply_task_mounts(
     root: &Path,
     writable_mounts: &[MountSpec],
@@ -661,7 +627,6 @@ fn apply_task_mounts(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn sandbox_error_to_io(error: SandboxError) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
@@ -670,8 +635,6 @@ async fn read_output_stream<R>(
     reader: Option<R>,
     capture: bool,
     max_output_size: usize,
-    output_events: Option<mpsc::UnboundedSender<TaskOutputEvent>>,
-    make_event: fn(Vec<u8>) -> TaskOutputEvent,
 ) -> std::io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
@@ -690,12 +653,8 @@ where
             break;
         }
 
-        let chunk = &buffer[..read];
-        if let Some(tx) = &output_events {
-            let _ = tx.send(make_event(chunk.to_vec()));
-        }
-
         if capture && !truncated {
+            let chunk = &buffer[..read];
             let available = max_output_size.saturating_sub(captured.len());
             if available == 0 {
                 truncated = true;

@@ -6,13 +6,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Output event emitted while a task is running.
-#[derive(Debug, Clone)]
-pub enum TaskOutputEvent {
-    Stdout(Vec<u8>),
-    Stderr(Vec<u8>),
-}
-
 /// A task to be executed in a sandbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
