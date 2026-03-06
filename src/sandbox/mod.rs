@@ -33,6 +33,9 @@ pub enum SandboxError {
     #[error("sandbox is not in idle state")]
     NotIdle,
 
+    #[error("failed to spawn sandbox process: {0}")]
+    SpawnFailed(String),
+
     #[error("sandbox execution failed: {0}")]
     ExecutionFailed(String),
 
@@ -44,6 +47,14 @@ pub enum SandboxError {
 
     #[error("system error: {0}")]
     System(#[from] nix::Error),
+}
+
+impl SandboxError {
+    /// Whether this error indicates the sandbox infrastructure itself is broken
+    /// (as opposed to a task-level failure like timeout or output capture issue).
+    pub fn is_sandbox_broken(&self) -> bool {
+        matches!(self, Self::SpawnFailed(_))
+    }
 }
 
 /// State of a sandbox.
@@ -199,7 +210,14 @@ impl Sandbox {
             }
         }
 
-        self.set_state(SandboxState::Idle);
+        match &result {
+            Err(e) if e.is_sandbox_broken() => {
+                self.set_state(SandboxState::Error(e.to_string()));
+            }
+            _ => {
+                self.set_state(SandboxState::Idle);
+            }
+        }
         result
     }
 
@@ -271,7 +289,7 @@ impl Sandbox {
 
         let child = cmd
             .spawn()
-            .map_err(|e| SandboxError::ExecutionFailed(format!("failed to spawn process: {e}")))?;
+            .map_err(|e| SandboxError::SpawnFailed(format!("failed to spawn process: {e}")))?;
 
         let mut child = child;
         if let Some(pid) = child.id() {
@@ -427,6 +445,14 @@ impl Drop for Sandbox {
     }
 }
 
+/// Write a message to stderr using async-signal-safe `libc::write`.
+/// Safe to call from a `pre_exec` (post-fork, pre-exec) context.
+fn write_stderr_safe(msg: &[u8]) {
+    unsafe {
+        libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
+    }
+}
+
 fn configure_task_process_linux(
     root: &Path,
     workdir: &Path,
@@ -438,6 +464,10 @@ fn configure_task_process_linux(
     writable_mounts: &[MountSpec],
     readonly_mounts: &[MountSpec],
 ) -> std::io::Result<()> {
+    // NOTE: This function runs in a forked child before exec().
+    // Only async-signal-safe functions may be called. In particular,
+    // tracing/log macros, heap allocation, and lock acquisition are
+    // forbidden. Use write_stderr_safe() for diagnostics.
     use nix::mount::{mount, umount2, MntFlags, MsFlags};
     use nix::sched::{unshare, CloneFlags};
 
@@ -445,18 +475,9 @@ fn configure_task_process_linux(
         return Err(std::io::Error::last_os_error());
     }
 
-    let mut cgroup_status = "disabled";
-    let mut cgroup_reason = String::from("no delegated cgroup available");
     if let Some(cgroup_path) = cgroup_path {
-        match cgroup::add_process_to_cgroup(cgroup_path, std::process::id()) {
-            Ok(()) => {
-                cgroup_status = "enabled";
-                cgroup_reason = "ok".to_string();
-            }
-            Err(error) => {
-                tracing::warn!(%error, cgroup = %cgroup_path.display(), "Failed to attach process to cgroup");
-                cgroup_reason = error.to_string();
-            }
+        if let Err(_) = cgroup::add_process_to_cgroup(cgroup_path, std::process::id()) {
+            write_stderr_safe(b"[apiary] warning: failed to attach process to cgroup\n");
         }
     }
 
@@ -473,15 +494,10 @@ fn configure_task_process_linux(
     )
     .map_err(|e| std::io::Error::other(format!("failed to bind mount new root: {e}")))?;
 
-    // Bind-mount task-specific directories BEFORE pivot_root (host paths still accessible).
     apply_task_mounts(root, writable_mounts, readonly_mounts)?;
 
-    let mut dev_mounts_status = "enabled";
-    let mut dev_mounts_reason = String::from("ok");
-    if let Err(error) = overlay::setup_dev_mounts(root) {
-        tracing::warn!(%error, "Failed to setup /dev; continuing");
-        dev_mounts_status = "disabled";
-        dev_mounts_reason = error.to_string();
+    if let Err(_) = overlay::setup_dev_mounts(root) {
+        write_stderr_safe(b"[apiary] warning: failed to setup /dev; continuing\n");
     }
 
     let put_old = root.join(".old_root");
@@ -491,12 +507,8 @@ fn configure_task_process_linux(
         .map_err(|e| std::io::Error::other(format!("failed to unmount old root: {e}")))?;
     let _ = std::fs::remove_dir_all("/.old_root");
 
-    let mut pseudo_fs_status = "enabled";
-    let mut pseudo_fs_reason = String::from("ok");
-    if let Err(error) = overlay::setup_post_pivot_mounts(Path::new("/")) {
-        tracing::warn!(%error, "Failed to mount pseudo-filesystems; continuing");
-        pseudo_fs_status = "disabled";
-        pseudo_fs_reason = error.to_string();
+    if let Err(_) = overlay::setup_post_pivot_mounts(Path::new("/")) {
+        write_stderr_safe(b"[apiary] warning: failed to mount pseudo-filesystems; continuing\n");
     }
 
     let effective_workdir = if workdir.is_absolute() {
@@ -518,38 +530,15 @@ fn configure_task_process_linux(
         }
     }
 
-    let mut seccomp_status = "disabled";
-    let mut seccomp_reason = String::from("not enabled");
     if enable_seccomp {
-        seccomp_status = "enabled";
-        seccomp_reason = "ok".to_string();
-        if let Err(error) = seccomp::set_no_new_privs() {
-            tracing::warn!(%error, "Failed to set no_new_privs; continuing without seccomp");
-            seccomp_status = "disabled";
-            seccomp_reason = format!("set_no_new_privs failed: {error}");
-        } else if let Err(error) = seccomp::apply_seccomp_filter(seccomp_policy) {
-            tracing::warn!(%error, "Failed to apply seccomp filter; continuing");
-            seccomp_status = "disabled";
-            seccomp_reason = error.to_string();
+        if let Err(_) = seccomp::set_no_new_privs() {
+            write_stderr_safe(
+                b"[apiary] warning: failed to set no_new_privs; continuing without seccomp\n",
+            );
+        } else if let Err(_) = seccomp::apply_seccomp_filter(seccomp_policy) {
+            write_stderr_safe(b"[apiary] warning: failed to apply seccomp filter; continuing\n");
         }
     }
-
-    tracing::info!(
-        mount_namespace_status = "enabled",
-        ipc_namespace_status = "enabled",
-        uts_namespace_status = "enabled",
-        pid_namespace_status = "disabled",
-        pid_namespace_reason = "unsupported in pre_exec with std::process::Command",
-        cgroup_status,
-        cgroup_reason = %cgroup_reason,
-        dev_mounts_status,
-        dev_mounts_reason = %dev_mounts_reason,
-        pseudo_fs_status,
-        pseudo_fs_reason = %pseudo_fs_reason,
-        seccomp_status,
-        seccomp_reason = %seccomp_reason,
-        "Sandbox feature status"
-    );
 
     Ok(())
 }

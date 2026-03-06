@@ -179,13 +179,28 @@ pub fn kill_cgroup_processes(cgroup_path: &Path) -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// Remove a cgroup.
+/// Remove a cgroup. Retries briefly for processes to exit after SIGKILL.
 pub fn remove_cgroup(cgroup_path: &Path) -> Result<(), SandboxError> {
     let _ = kill_cgroup_processes(cgroup_path);
-    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    for _ in 0..10 {
+        match fs::remove_dir(cgroup_path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(SandboxError::CgroupSetup(format!(
+                    "failed to remove cgroup {}: {e}",
+                    cgroup_path.display()
+                )));
+            }
+        }
+    }
+
     fs::remove_dir(cgroup_path).map_err(|e| {
         SandboxError::CgroupSetup(format!(
-            "failed to remove cgroup {}: {e}",
+            "failed to remove cgroup {} after retries: {e}",
             cgroup_path.display()
         ))
     })

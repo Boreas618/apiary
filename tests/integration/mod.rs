@@ -130,16 +130,12 @@ mod linux_tests {
     use apiary::Pool;
 
     #[test]
-    fn test_seccomp_policy() {
-        use apiary::sandbox::seccomp::{network_only_policy, strict_policy};
+    fn test_default_seccomp_policy() {
+        use apiary::SeccompPolicy;
 
-        let policy = network_only_policy();
+        let policy = SeccompPolicy::default();
         assert!(policy.block_network);
         assert!(policy.allow_unix_sockets);
-
-        let strict = strict_policy();
-        assert!(strict.block_network);
-        assert!(!strict.blocked_syscalls.is_empty());
     }
 
     #[test]
@@ -154,14 +150,9 @@ mod linux_tests {
     }
 
     #[test]
-    fn test_namespace_config() {
-        use apiary::sandbox::namespace::NamespaceConfig;
-
-        let config = NamespaceConfig::default();
-        assert!(config.user_ns);
-        assert!(config.mount_ns);
-        assert!(config.pid_ns);
-        assert!(!config.net_ns); // Shared host network by default
+    fn test_namespace_rootless_mode_check() {
+        use apiary::sandbox::namespace::is_rootless_mode;
+        let _ = is_rootless_mode();
     }
 
     #[tokio::test]

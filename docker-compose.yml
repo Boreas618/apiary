@@ -15,6 +15,12 @@ services:
       - /sys/fs/cgroup:rw,mode=755
     environment:
       RUST_BACKTRACE: "1"
+      APIARY_OVERLAY_DIR: /var/lib/apiary/overlays
+      CARGO_TARGET_DIR: /var/lib/apiary/target
     volumes:
       - .:/workspace
+      - apiary-overlays:/var/lib/apiary/overlays
     working_dir: /workspace
+
+volumes:
+  apiary-overlays:

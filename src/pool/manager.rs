@@ -6,7 +6,7 @@
 //! sandboxes that have been idle longer than `idle_timeout`, shrinking the
 //! pool back toward `min_sandboxes`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -118,7 +118,7 @@ fn resolve_task_working_dir(
 pub struct Pool {
     config: Arc<PoolConfig>,
     sandboxes: Arc<RwLock<HashMap<String, Arc<Sandbox>>>>,
-    idle_queue: Arc<Mutex<Vec<String>>>,
+    idle_queue: Arc<Mutex<VecDeque<String>>>,
     idle_notify: Arc<Notify>,
     sessions: Arc<RwLock<HashMap<String, SessionHandle>>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -131,7 +131,7 @@ impl Pool {
     pub async fn new(config: PoolConfig) -> Result<Self, PoolError> {
         let config = Arc::new(config);
         let sandboxes = Arc::new(RwLock::new(HashMap::new()));
-        let idle_queue = Arc::new(Mutex::new(Vec::new()));
+        let idle_queue = Arc::new(Mutex::new(VecDeque::new()));
         let idle_notify = Arc::new(Notify::new());
         let sessions = Arc::new(RwLock::new(HashMap::new()));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -168,7 +168,7 @@ impl Pool {
             let id = sandbox.id().to_string();
             self.sandboxes.write().insert(id.clone(), Arc::new(sandbox));
             self.idle_since.write().insert(id.clone(), now);
-            self.idle_queue.lock().push(id);
+            self.idle_queue.lock().push_back(id);
         }
 
         self.idle_notify.notify_waiters();
@@ -248,7 +248,7 @@ impl Pool {
                                 pool.idle_since
                                     .write()
                                     .insert(sb_id.clone(), Instant::now());
-                                pool.idle_queue.lock().push(sb_id.clone());
+                                pool.idle_queue.lock().push_back(sb_id.clone());
                                 pool.idle_notify.notify_one();
                                 tracing::info!(
                                     sandbox_id = %sb_id,
@@ -302,7 +302,7 @@ impl Pool {
     /// Pop one sandbox from the idle queue (non-blocking).
     fn try_pop_idle(&self) -> Option<Arc<Sandbox>> {
         loop {
-            let id = self.idle_queue.lock().pop()?;
+            let id = self.idle_queue.lock().pop_front()?;
             self.idle_since.write().remove(&id);
             if let Some(sb) = self.sandboxes.read().get(&id).cloned() {
                 return Some(sb);
@@ -316,7 +316,7 @@ impl Pool {
         self.idle_since
             .write()
             .insert(sandbox_id.to_string(), Instant::now());
-        self.idle_queue.lock().push(sandbox_id.to_string());
+        self.idle_queue.lock().push_back(sandbox_id.to_string());
         self.idle_notify.notify_one();
     }
 
@@ -685,17 +685,18 @@ impl Pool {
         }
 
         if let Some(idx) = oldest_idx {
-            let id = idle_queue.remove(idx);
-            drop(idle_queue);
+            if let Some(id) = idle_queue.remove(idx) {
+                drop(idle_queue);
 
-            self.remove_sandbox(&id);
-            *self.last_scale_event.lock() = Instant::now();
+                self.remove_sandbox(&id);
+                *self.last_scale_event.lock() = Instant::now();
 
-            tracing::info!(
-                sandbox_id = %id,
-                total = self.sandboxes.read().len(),
-                "scaled down: removed idle sandbox"
-            );
+                tracing::info!(
+                    sandbox_id = %id,
+                    total = self.sandboxes.read().len(),
+                    "scaled down: removed idle sandbox"
+                );
+            }
         }
     }
 

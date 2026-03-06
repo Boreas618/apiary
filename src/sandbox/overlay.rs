@@ -79,7 +79,7 @@ pub fn setup_overlay(
                     Ok(ActiveOverlay::KernelOverlay)
                 }
                 Err(kernel_err) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         %kernel_err,
                         "Kernel overlay mount failed; trying fuse-overlayfs"
                     );

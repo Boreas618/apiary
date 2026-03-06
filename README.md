@@ -4,7 +4,7 @@ A lightweight sandbox pool for running AI agent tasks on Linux with namespace is
 
 ## Features
 
-- **Namespace Isolation**: User, Mount, and PID namespace isolation for each sandbox
+- **Namespace Isolation**: User, Mount, IPC, and UTS namespace isolation for each sandbox
 - **OverlayFS**: Shared read-only base with per-sandbox writable layers (saves 95%+ disk space)
 - **seccomp**: Network syscall filtering for security
 - **cgroups v2**: Resource limits (CPU, memory, PIDs, I/O)
@@ -74,10 +74,11 @@ docker compose run --rm apiary cargo build
 
 The Docker setup is preconfigured for sandbox features:
 
-- Installs `uidmap` (`newuidmap`/`newgidmap`), `fuse-overlayfs`, and `gosu`
-- Sets subordinate ID ranges in `/etc/subuid` and `/etc/subgid`
-- Starts the container with security options needed for `unshare`
-- Entrypoint automatically sets up cgroups v2 delegation before dropping to unprivileged user
+- Installs `uidmap` (`newuidmap`/`newgidmap`) and `fuse-overlayfs`
+- Sets subordinate ID ranges in `/etc/subuid` and `/etc/subgid` for root
+- Starts the container with security options needed for `unshare` (`SYS_ADMIN`, `seccomp=unconfined`)
+- Entrypoint automatically sets up cgroups v2 delegation (controller enablement and subtree creation)
+- The container runs as root; `apiary` then enters its own user namespace for rootless sandbox operation
 - Run `verify-sandbox.sh` inside the container for a quick health check
 
 ## Quick Start
@@ -329,14 +330,15 @@ The sandbox provides multiple layers of isolation:
 
 1. **User Namespace**: Maps root inside sandbox to unprivileged user outside
 2. **Mount Namespace**: Isolated filesystem view with OverlayFS
-3. **PID Namespace**: Isolated process tree (PIDs start from 1)
-4. **seccomp**: Blocks network syscalls and other dangerous operations
-5. **cgroups**: Limits CPU, memory, and other resources
+3. **IPC Namespace**: Isolated System V IPC and POSIX message queues
+4. **UTS Namespace**: Isolated hostname
+5. **seccomp**: Blocks network syscalls and other dangerous operations (when enabled)
+6. **cgroups**: Limits CPU, memory, and other resources
 
 ### Protected Paths
 
 - `/proc`, `/sys`: Mounted with appropriate restrictions
-- Network: Blocked by default via seccomp
+- Network: Blocked by default via seccomp syscall filtering (note: this is not network namespace isolation; enable seccomp with `--seccomp`)
 
 ## License
 

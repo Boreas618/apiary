@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use apiary::{Pool, PoolConfig, PoolError, SessionOptions, Task};
+use futures::stream::{self, StreamExt};
 
 use crate::api::server;
 
@@ -93,10 +94,12 @@ pub async fn run_daemon(
         );
     }
 
-    let mut config = PoolConfig::from_file(&config_file)?;
-    if enable_seccomp {
-        config.enable_seccomp = true;
-    }
+    let config = PoolConfig::from_file(&config_file)?;
+    let config = if enable_seccomp {
+        config.with_seccomp_enabled(true)
+    } else {
+        config
+    };
     tracing::info!("Loaded config from: {}", config_file.display());
 
     let pool = Pool::new(config).await?;
@@ -129,10 +132,12 @@ pub async fn run_task(
         );
     }
 
-    let mut config = PoolConfig::from_file(&config_file)?;
-    if enable_seccomp {
-        config.enable_seccomp = true;
-    }
+    let config = PoolConfig::from_file(&config_file)?;
+    let config = if enable_seccomp {
+        config.with_seccomp_enabled(true)
+    } else {
+        config
+    };
     let pool = Pool::new(config.clone()).await?;
 
     let env_map: HashMap<String, String> = env
@@ -238,16 +243,15 @@ pub async fn run_batch(
         anyhow::bail!("Tasks file not found: {}", tasks_file.display());
     }
 
-    let mut config = PoolConfig::from_file(&config_file)?;
-    if enable_seccomp {
-        config.enable_seccomp = true;
-    }
-
-    let config = PoolConfig {
-        min_sandboxes: parallelism.min(config.min_sandboxes),
-        max_sandboxes: parallelism.min(config.max_sandboxes),
-        ..config
+    let config = PoolConfig::from_file(&config_file)?;
+    let config = if enable_seccomp {
+        config.with_seccomp_enabled(true)
+    } else {
+        config
     };
+    let capped_min = parallelism.min(config.min_sandboxes);
+    let capped_max = parallelism.min(config.max_sandboxes);
+    let config = config.with_pool_bounds(capped_min, capped_max)?;
 
     let tasks_content = std::fs::read_to_string(&tasks_file)?;
     let tasks: Vec<Task> = serde_json::from_str(&tasks_content)?;
@@ -259,7 +263,7 @@ pub async fn run_batch(
 
     let start = std::time::Instant::now();
     let results: Vec<Result<apiary::TaskResult, PoolError>> =
-        futures::future::join_all(tasks.into_iter().map(|task| {
+        stream::iter(tasks.into_iter().map(|task| {
             let pool = pool.clone();
             async move {
                 let session_id = pool.create_session(SessionOptions::default()).await?;
@@ -283,6 +287,8 @@ pub async fn run_batch(
                 }
             }
         }))
+        .buffer_unordered(parallelism)
+        .collect()
         .await;
     let duration = start.elapsed();
 

@@ -110,6 +110,18 @@ pub async fn run_server(bind: String, pool: Pool, api_token: Option<String>) -> 
     Ok(())
 }
 
+/// Constant-time byte comparison to prevent timing attacks on token validation.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut result = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        result |= x ^ y;
+    }
+    result == 0
+}
+
 async fn auth_layer(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -123,7 +135,7 @@ async fn auth_layer(
             .and_then(|s| s.strip_prefix("Bearer "));
 
         match auth {
-            Some(token) if token == expected.as_str() => {}
+            Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {}
             _ => {
                 return Ok((
                     StatusCode::UNAUTHORIZED,

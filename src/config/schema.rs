@@ -23,11 +23,11 @@ pub struct PoolConfig {
     pub scale_up_step: usize,
 
     /// How long an excess sandbox (above min) can be idle before removal.
-    #[serde(default = "default_idle_timeout", with = "duration_string_serde")]
+    #[serde(default = "default_idle_timeout", with = "duration_serde")]
     pub idle_timeout: Duration,
 
     /// Minimum interval between scaling events to prevent thrashing.
-    #[serde(default = "default_cooldown", with = "cooldown_serde")]
+    #[serde(default = "default_cooldown", with = "duration_serde")]
     pub cooldown: Duration,
 
     /// Path to the base rootfs image (lower layer for OverlayFS).
@@ -53,7 +53,7 @@ pub struct PoolConfig {
     pub seccomp_policy: SeccompPolicy,
 
     /// Default timeout for tasks.
-    #[serde(default = "default_timeout", with = "task_timeout_serde")]
+    #[serde(default = "default_timeout", with = "duration_serde")]
     pub default_timeout: Duration,
 
     /// Default working directory inside sandbox.
@@ -193,6 +193,40 @@ impl Default for SeccompPolicy {
             blocked_syscalls: Vec::new(),
             allowed_syscalls: Vec::new(),
         }
+    }
+}
+
+impl PoolConfig {
+    /// Validate invariants that must hold for the config to be usable.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.min_sandboxes == 0 {
+            anyhow::bail!("min_sandboxes must be at least 1");
+        }
+        if self.max_sandboxes < self.min_sandboxes {
+            anyhow::bail!(
+                "max_sandboxes ({}) must be >= min_sandboxes ({})",
+                self.max_sandboxes,
+                self.min_sandboxes
+            );
+        }
+        if self.scale_up_step == 0 {
+            anyhow::bail!("scale_up_step must be at least 1");
+        }
+        Ok(())
+    }
+
+    /// Return a new config with seccomp enabled/disabled.
+    pub fn with_seccomp_enabled(mut self, enabled: bool) -> Self {
+        self.enable_seccomp = enabled;
+        self
+    }
+
+    /// Return a new config with adjusted pool bounds (validates invariants).
+    pub fn with_pool_bounds(mut self, min: usize, max: usize) -> anyhow::Result<Self> {
+        self.min_sandboxes = min;
+        self.max_sandboxes = max;
+        self.validate()?;
+        Ok(self)
     }
 }
 
@@ -372,14 +406,6 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     }
 }
 
-mod duration_string_serde {
-    pub use super::{deserialize_duration as deserialize, serialize_duration as serialize};
-}
-
-mod cooldown_serde {
-    pub use super::{deserialize_duration as deserialize, serialize_duration as serialize};
-}
-
-mod task_timeout_serde {
+mod duration_serde {
     pub use super::{deserialize_duration as deserialize, serialize_duration as serialize};
 }

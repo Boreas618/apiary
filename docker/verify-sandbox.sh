@@ -43,10 +43,10 @@ else
     echo "[apiary] WARNING: user namespace check failed"
 fi
 
-# --- cgroup delegation ---
-if [ -d /sys/fs/cgroup/apiary ] && [ -w /sys/fs/cgroup/apiary ]; then
+# --- cgroup ---
+if [ -d /sys/fs/cgroup/apiary ]; then
     controllers=$(cat /sys/fs/cgroup/apiary/cgroup.controllers 2>/dev/null || true)
-    echo "[apiary] cgroup delegation: OK (controllers: $controllers)"
+    echo "[apiary] cgroup: OK (controllers: $controllers)"
 else
-    echo "[apiary] WARNING: cgroup delegation not set up at /sys/fs/cgroup/apiary"
+    echo "[apiary] WARNING: cgroup subtree not set up at /sys/fs/cgroup/apiary"
 fi

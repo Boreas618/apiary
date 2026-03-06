@@ -41,6 +41,23 @@ fn build_filter(policy: &SeccompPolicy) -> Result<SeccompFilter, SandboxError> {
         }
     }
 
+    if policy.block_network && !policy.allowed_syscalls.is_empty() {
+        let network_syscalls = [
+            "socket", "socketpair", "connect", "accept", "accept4", "bind", "listen", "sendto",
+            "sendmsg", "sendmmsg", "recvfrom", "recvmsg", "recvmmsg", "shutdown", "getsockname",
+            "getpeername", "getsockopt", "setsockopt",
+        ];
+        for name in &policy.allowed_syscalls {
+            let lower = name.to_lowercase();
+            if network_syscalls.contains(&lower.as_str()) {
+                tracing::warn!(
+                    syscall = %name,
+                    "allowed_syscalls contains a network syscall, undermining block_network"
+                );
+            }
+        }
+    }
+
     for syscall_name in &policy.allowed_syscalls {
         if let Some(nr) = syscall_number(syscall_name) {
             rules.remove(&nr);
@@ -178,38 +195,6 @@ pub fn set_no_new_privs() -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// A predefined strict seccomp policy that blocks most dangerous operations.
-pub fn strict_policy() -> SeccompPolicy {
-    SeccompPolicy {
-        block_network: true,
-        allow_unix_sockets: true,
-        blocked_syscalls: vec![
-            "mount".to_string(),
-            "umount".to_string(),
-            "pivot_root".to_string(),
-            "chroot".to_string(),
-            "setns".to_string(),
-            "unshare".to_string(),
-            "reboot".to_string(),
-            "kexec_load".to_string(),
-            "init_module".to_string(),
-            "finit_module".to_string(),
-            "delete_module".to_string(),
-        ],
-        allowed_syscalls: vec![],
-    }
-}
-
-/// A permissive seccomp policy that only blocks network.
-pub fn network_only_policy() -> SeccompPolicy {
-    SeccompPolicy {
-        block_network: true,
-        allow_unix_sockets: true,
-        blocked_syscalls: vec![],
-        allowed_syscalls: vec![],
-    }
-}
-
 /// Check if seccomp is available on this system.
 pub fn is_seccomp_available() -> bool {
     // Try to check if seccomp is available by querying the kernel
@@ -236,22 +221,6 @@ mod tests {
         assert!(matches!(arch, TargetArch::x86_64));
         #[cfg(target_arch = "aarch64")]
         assert!(matches!(arch, TargetArch::aarch64));
-    }
-
-    #[test]
-    fn test_strict_policy() {
-        let policy = strict_policy();
-        assert!(policy.block_network);
-        assert!(policy.allow_unix_sockets);
-        assert!(!policy.blocked_syscalls.is_empty());
-    }
-
-    #[test]
-    fn test_network_only_policy() {
-        let policy = network_only_policy();
-        assert!(policy.block_network);
-        assert!(policy.allow_unix_sockets);
-        assert!(policy.blocked_syscalls.is_empty());
     }
 
     #[test]

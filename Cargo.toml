@@ -40,7 +40,6 @@ clap = { version = "4", features = ["derive", "env"] }
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 parking_lot = "0.12"
-crossbeam-channel = "0.5"
 shell-words = "1"
 futures = "0.3"
 libc = "0.2"

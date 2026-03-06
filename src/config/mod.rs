@@ -12,6 +12,7 @@ impl PoolConfig {
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: PoolConfig = toml::from_str(&content)?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -32,6 +33,9 @@ impl PoolConfig {
 
     /// Get the default overlay directory path.
     pub fn default_overlay_dir() -> std::path::PathBuf {
+        if let Ok(dir) = std::env::var("APIARY_OVERLAY_DIR") {
+            return std::path::PathBuf::from(dir);
+        }
         dirs::data_local_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("apiary")

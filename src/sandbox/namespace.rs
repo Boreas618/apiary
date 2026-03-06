@@ -6,42 +6,6 @@
 
 use super::SandboxError;
 
-/// Configuration for namespace creation.
-#[derive(Debug, Clone)]
-pub struct NamespaceConfig {
-    /// Create a new user namespace (required for rootless).
-    pub user_ns: bool,
-    /// Create a new mount namespace.
-    pub mount_ns: bool,
-    /// Create a new PID namespace.
-    pub pid_ns: bool,
-    /// Create a new network namespace.
-    pub net_ns: bool,
-    /// Create a new UTS namespace (hostname).
-    pub uts_ns: bool,
-    /// Create a new IPC namespace.
-    pub ipc_ns: bool,
-    /// UID to map inside the user namespace (maps to current UID outside).
-    pub inner_uid: u32,
-    /// GID to map inside the user namespace (maps to current GID outside).
-    pub inner_gid: u32,
-}
-
-impl Default for NamespaceConfig {
-    fn default() -> Self {
-        Self {
-            user_ns: true,
-            mount_ns: true,
-            pid_ns: true,
-            net_ns: false, // Shared host network by default
-            uts_ns: false,
-            ipc_ns: false,
-            inner_uid: 0, // Map to root inside the namespace
-            inner_gid: 0,
-        }
-    }
-}
-
 /// Returns the real UID from before entering the user namespace.
 /// Falls back to `Uid::current()` if rootless mode was never entered.
 pub fn original_uid() -> u32 {
@@ -67,6 +31,15 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+
+/// Create namespaces for the sandbox child process (called from pre_exec).
+/// Unshares mount, IPC, and UTS namespaces for the current process.
+pub fn unshare_task_namespaces() -> Result<(), SandboxError> {
+    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS)
+        .map_err(|e| {
+            SandboxError::NamespaceCreation(format!("failed to unshare task namespaces: {e}"))
+        })
+}
 
 #[derive(Debug, Clone, Copy)]
 enum IdMapKind {
@@ -108,48 +81,6 @@ struct IdMapEntry {
     inside: u32,
     outside: u32,
     count: u32,
-}
-
-/// Create namespaces for the current process (in-place).
-pub fn create_namespaces(config: &NamespaceConfig) -> Result<(), SandboxError> {
-    let mut flags = CloneFlags::empty();
-    let outer_uid = Uid::current().as_raw();
-    let outer_gid = Gid::current().as_raw();
-
-    // User namespace must be created first for rootless operation
-    if config.user_ns {
-        unshare(CloneFlags::CLONE_NEWUSER).map_err(|e| {
-            SandboxError::NamespaceCreation(format!("failed to create user namespace: {e}"))
-        })?;
-
-        let pid = std::process::id();
-        setup_uid_map_for_pid(pid, config.inner_uid, outer_uid)?;
-        setup_gid_map_for_pid(pid, config.inner_gid, outer_gid)?;
-    }
-
-    if config.mount_ns {
-        flags |= CloneFlags::CLONE_NEWNS;
-    }
-    if config.pid_ns {
-        flags |= CloneFlags::CLONE_NEWPID;
-    }
-    if config.net_ns {
-        flags |= CloneFlags::CLONE_NEWNET;
-    }
-    if config.uts_ns {
-        flags |= CloneFlags::CLONE_NEWUTS;
-    }
-    if config.ipc_ns {
-        flags |= CloneFlags::CLONE_NEWIPC;
-    }
-
-    if !flags.is_empty() {
-        unshare(flags).map_err(|e| {
-            SandboxError::NamespaceCreation(format!("failed to create namespaces: {e}"))
-        })?;
-    }
-
-    Ok(())
 }
 
 fn setup_uid_map_for_pid(pid: u32, inner_uid: u32, outer_uid: u32) -> Result<(), SandboxError> {
@@ -435,15 +366,6 @@ pub fn set_hostname(hostname: &str) -> Result<(), SandboxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_namespace_config_default() {
-        let config = NamespaceConfig::default();
-        assert!(config.user_ns);
-        assert!(config.mount_ns);
-        assert!(config.pid_ns);
-        assert!(!config.net_ns);
-    }
 
     #[test]
     fn test_parse_subordinate_ranges_matches_username_and_uid() {
