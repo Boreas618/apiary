@@ -345,12 +345,7 @@ impl Pool {
                 .unwrap_or(self.config.default_workdir.as_path()),
         );
 
-        let session_id = loop {
-            let id = Uuid::new_v4().to_string();
-            if !self.sessions.read().contains_key(&id) {
-                break id;
-            }
-        };
+        let session_id = Uuid::new_v4().to_string();
 
         self.sessions.write().insert(
             session_id.clone(),
