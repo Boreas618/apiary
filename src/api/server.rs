@@ -176,7 +176,7 @@ async fn create_session(
         .unwrap_or_default();
     let session_id = state
         .pool
-        .create_session_with_options(session_options)
+        .create_session(session_options)
         .await
         .map_err(ApiError::from_pool_error)?;
 

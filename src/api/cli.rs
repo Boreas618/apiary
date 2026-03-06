@@ -151,13 +151,10 @@ pub async fn run_task(
         .timeout(Duration::from_secs(timeout))
         .envs(env_map);
 
-    let session_result = match workdir {
-        Some(dir) => {
-            pool.create_session_with_options(SessionOptions::default().working_dir(dir))
-                .await
-        }
-        None => pool.create_session().await,
-    };
+    let session_options = workdir
+        .map(|dir| SessionOptions::default().working_dir(dir))
+        .unwrap_or_default();
+    let session_result = pool.create_session(session_options).await;
     let session_id = match session_result {
         Ok(session_id) => session_id,
         Err(error) => {
@@ -265,7 +262,7 @@ pub async fn run_batch(
         futures::future::join_all(tasks.into_iter().map(|task| {
             let pool = pool.clone();
             async move {
-                let session_id = pool.create_session().await?;
+                let session_id = pool.create_session(SessionOptions::default()).await?;
                 let execution_result = pool.execute_in_session(&session_id, task).await;
                 let close_result = pool.close_session(&session_id).await;
 

@@ -245,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
         .env("MY_VAR", "value");
 
     let session_id = pool
-        .create_session_with_options(SessionOptions::default().working_dir("/workspace"))
+        .create_session(SessionOptions::default().working_dir("/workspace"))
         .await?;
     let result = pool.execute_in_session(&session_id, task).await?;
     println!("Exit code: {}", result.exit_code);

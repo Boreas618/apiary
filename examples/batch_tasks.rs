@@ -12,7 +12,7 @@
 //! docker export $(docker create ubuntu:20.04) | tar -xf - -C ./rootfs
 //! ```
 
-use apiary::{Pool, PoolConfig, Task};
+use apiary::{Pool, PoolConfig, SessionOptions, Task};
 use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
@@ -74,7 +74,7 @@ async fn async_main() -> anyhow::Result<()> {
     let results = futures::future::join_all(tasks.into_iter().map(|task| {
         let pool = pool.clone();
         async move {
-            let session_id = pool.create_session().await?;
+            let session_id = pool.create_session(SessionOptions::default()).await?;
             let execution_result = pool.execute_in_session(&session_id, task).await;
             let close_result = pool.close_session(&session_id).await;
 

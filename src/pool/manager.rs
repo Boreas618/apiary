@@ -327,15 +327,9 @@ impl Pool {
     /// Create a persistent session bound to a single sandbox.
     ///
     /// If no idle sandbox is available the pool scales up automatically (up to
-    /// `max_sandboxes`).  Only when the hard cap is reached does the call
-    /// block with a timeout.
-    pub async fn create_session(&self) -> Result<String, PoolError> {
-        self.create_session_with_options(SessionOptions::default())
-            .await
-    }
-
-    /// Create a persistent session with explicit options.
-    pub async fn create_session_with_options(
+    /// `max_sandboxes`). Only when the hard cap is reached does the call block
+    /// with a timeout.
+    pub async fn create_session(
         &self,
         options: SessionOptions,
     ) -> Result<String, PoolError> {
