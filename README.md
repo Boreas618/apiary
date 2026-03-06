@@ -11,7 +11,7 @@ A lightweight sandbox pool for running AI agent tasks on Linux with namespace is
 - **Rootless**: Can run without root privileges (Linux 5.11+)
 - **Pool Management**: Pre-created sandbox pool for fast task execution
 - **Batch Execution**: Run multiple tasks in parallel
-- **Daemon API**: HTTP REST with optional SSE task streaming
+- **Daemon API**: HTTP REST API for task execution
 - **Persistent Sessions**: Pin a sandbox to a session and keep filesystem state across commands
 
 ## Requirements
@@ -49,7 +49,7 @@ your-user:100000:65536
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/apiary
+git clone https://github.com/Boreas618/apiary.git
 cd apiary
 
 # Build
@@ -98,7 +98,7 @@ sudo debootstrap --variant=minbase jammy ./rootfs
 ### 2. Initialize the Pool
 
 ```bash
-apiary init --base-image ./rootfs --pool-size 10
+apiary init --base-image ./rootfs --min-sandboxes 10 --max-sandboxes 40
 ```
 
 ### 3. Run Tasks
@@ -117,7 +117,7 @@ apiary batch --tasks tasks.json --parallelism 5
 
 ```bash
 # Initialize pool
-apiary init --base-image ./rootfs --pool-size 10
+apiary init --base-image ./rootfs --min-sandboxes 10 --max-sandboxes 40
 
 # Run daemon (for API access)
 apiary daemon --bind 127.0.0.1:8080
@@ -147,7 +147,6 @@ When running `apiary daemon`, the server exposes:
 - `POST /api/v1/sessions` - create a persistent session (reserves one sandbox; accepts optional `working_dir`)
 - `DELETE /api/v1/sessions/:session_id` - close session, reset sandbox, and release it
 - `POST /api/v1/tasks` - execute a task in a session and return JSON result (`session_id` required)
-- `POST /api/v1/tasks?stream=true` - execute a task in a session and stream output via SSE (`session_id` required)
 
 Working directory resolution order is:
 
@@ -181,16 +180,6 @@ curl -sS \
   -X POST "http://127.0.0.1:8080/api/v1/tasks" \
   -H "Content-Type: application/json" \
   -d "{\"command\":\"echo hello from api\",\"session_id\":\"${SESSION_ID}\"}"
-```
-
-Execute with SSE streaming:
-
-```bash
-# Reuse the same SESSION_ID
-curl -N \
-  -X POST "http://127.0.0.1:8080/api/v1/tasks?stream=true" \
-  -H "Content-Type: application/json" \
-  -d "{\"command\":\"bash -lc 'echo out; echo err 1>&2; sleep 1; echo done'\",\"session_id\":\"${SESSION_ID}\"}"
 ```
 
 Create and use a persistent session (filesystem changes survive between commands):
@@ -263,11 +252,16 @@ async fn main() -> anyhow::Result<()> {
 Configuration is stored in `~/.config/apiary/config.toml`:
 
 ```toml
-pool_size = 10
+min_sandboxes = 10
+max_sandboxes = 40
+scale_up_step = 2
+idle_timeout = "300s"
+cooldown = "30s"
 base_image = "./rootfs"
 overlay_dir = "~/.local/share/apiary/overlays"
 default_timeout = "300s"
 default_workdir = "/workspace"
+enable_seccomp = false
 
 [resource_limits]
 memory_max = "2G"
@@ -280,6 +274,9 @@ allow_unix_sockets = true
 ```
 
 ## Tasks JSON Format
+
+The batch tasks file uses the `Task` struct directly. Note that `timeout` is in
+**milliseconds** (unlike the HTTP API which accepts `timeout_secs` or `timeout_ms`).
 
 ```json
 [
@@ -340,13 +337,6 @@ The sandbox provides multiple layers of isolation:
 
 - `/proc`, `/sys`: Mounted with appropriate restrictions
 - Network: Blocked by default via seccomp
-
-## Performance
-
-- Sandbox creation: ~1-5ms (reused from pool)
-- Task overhead: <10ms
-- Memory per sandbox: ~10MB base + overlay writes
-- Disk per sandbox: Only stores diff from base image
 
 ## License
 

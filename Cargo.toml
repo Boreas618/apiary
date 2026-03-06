@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Yi Sun"]
 description = "A lightweight sandbox pool for running agents"
 license = "MIT"
-repository = "https://github.com/yisun/apiary"
+repository = "https://github.com/Boreas618/apiary"
 keywords = ["sandbox", "container", "namespace", "linux", "isolation"]
 categories = ["os::linux-apis", "development-tools"]
 
