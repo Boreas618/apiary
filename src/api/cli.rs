@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use apiary::{Pool, PoolConfig, PoolError, Task};
+use apiary::{Pool, PoolConfig, PoolError, SessionOptions, Task};
 
 use crate::api::server;
 
@@ -55,11 +55,21 @@ pub async fn init_pool(
     let status = pool.status();
 
     println!("Pool initialized successfully!");
-    println!("  Sandboxes: {} (min={}, max={})", status.total, status.min_sandboxes, status.max_sandboxes);
+    println!(
+        "  Sandboxes: {} (min={}, max={})",
+        status.total, status.min_sandboxes, status.max_sandboxes
+    );
     println!("  Scale-up step: {scale_up_step}");
     println!("  Idle timeout: {idle_timeout:?}");
     println!("  Cooldown: {cooldown:?}");
-    println!("  Seccomp: {}", if enable_seccomp { "enabled" } else { "disabled" });
+    println!(
+        "  Seccomp: {}",
+        if enable_seccomp {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     println!("  Config file: {}", config_file.display());
     println!("  Overlay dir: {}", overlay_dir.display());
 
@@ -137,17 +147,18 @@ pub async fn run_task(
         })
         .collect();
 
-    let mut task = Task::new(&command)
+    let task = Task::new(&command)
         .timeout(Duration::from_secs(timeout))
         .envs(env_map);
 
-    if let Some(dir) = workdir {
-        task = task.working_dir(dir);
-    } else {
-        task = task.working_dir(&config.default_workdir);
-    }
-
-    let session_id = match pool.create_session().await {
+    let session_result = match workdir {
+        Some(dir) => {
+            pool.create_session_with_options(SessionOptions::default().working_dir(dir))
+                .await
+        }
+        None => pool.create_session().await,
+    };
+    let session_id = match session_result {
         Ok(session_id) => session_id,
         Err(error) => {
             pool.shutdown().await;
@@ -250,8 +261,8 @@ pub async fn run_batch(
     tracing::info!("Running with parallelism: {parallelism} (session-only mode)");
 
     let start = std::time::Instant::now();
-    let results: Vec<Result<apiary::TaskResult, PoolError>> = futures::future::join_all(
-        tasks.into_iter().map(|task| {
+    let results: Vec<Result<apiary::TaskResult, PoolError>> =
+        futures::future::join_all(tasks.into_iter().map(|task| {
             let pool = pool.clone();
             async move {
                 let session_id = pool.create_session().await?;
@@ -274,9 +285,8 @@ pub async fn run_batch(
                     }
                 }
             }
-        }),
-    )
-    .await;
+        }))
+        .await;
     let duration = start.elapsed();
 
     let mut succeeded = 0;
@@ -416,7 +426,10 @@ pub async fn cleanup(force: bool, config_path: Option<PathBuf>) -> anyhow::Resul
     }
 
     if config.overlay_dir.exists() {
-        tracing::info!("Removing overlay directory: {}", config.overlay_dir.display());
+        tracing::info!(
+            "Removing overlay directory: {}",
+            config.overlay_dir.display()
+        );
         std::fs::remove_dir_all(&config.overlay_dir)?;
     }
 

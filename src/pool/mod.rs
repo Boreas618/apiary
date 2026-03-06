@@ -2,4 +2,4 @@
 
 mod manager;
 
-pub use manager::{Pool, PoolError, PoolStatus};
+pub use manager::{Pool, PoolError, PoolStatus, SessionOptions};

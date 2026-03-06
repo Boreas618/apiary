@@ -33,6 +33,7 @@ fn test_task_creation() {
     let task = Task::new("echo hello");
     assert_eq!(task.command, vec!["echo", "hello"]);
     assert!(!task.id.is_empty());
+    assert_eq!(task.working_dir, None);
 }
 
 #[test]
@@ -46,6 +47,7 @@ fn test_task_builder() {
 
     assert_eq!(task.command[0], "python3");
     assert_eq!(task.timeout, Duration::from_secs(30));
+    assert_eq!(task.working_dir, None);
 }
 
 #[test]

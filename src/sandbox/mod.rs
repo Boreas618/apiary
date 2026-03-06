@@ -203,10 +203,7 @@ impl Sandbox {
         result
     }
 
-    async fn run_task_inner(
-        &self,
-        task: &Task,
-    ) -> Result<TaskResult, SandboxError> {
+    async fn run_task_inner(&self, task: &Task) -> Result<TaskResult, SandboxError> {
         use tokio::process::Command;
         use tokio::time::timeout;
 
@@ -218,7 +215,10 @@ impl Sandbox {
         let args: Vec<&str> = task.command.iter().skip(1).map(|s| s.as_str()).collect();
 
         let root = self.root_path.clone();
-        let workdir = task.working_dir.clone();
+        let workdir = task
+            .working_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/workspace"));
         let cgroup_path = self.cgroup_path.clone();
         let enable_seccomp = self.enable_seccomp;
         let seccomp_policy = self.seccomp_policy.clone();

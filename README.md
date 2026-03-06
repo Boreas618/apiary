@@ -144,12 +144,20 @@ When running `apiary daemon`, the server exposes:
 
 - `GET /healthz` - liveness probe
 - `GET /api/v1/status` - pool status and counters (includes `reserved` session sandboxes)
-- `POST /api/v1/sessions` - create a persistent session (reserves one sandbox)
+- `POST /api/v1/sessions` - create a persistent session (reserves one sandbox; accepts optional `working_dir`)
 - `DELETE /api/v1/sessions/:session_id` - close session, reset sandbox, and release it
 - `POST /api/v1/tasks` - execute a task in a session and return JSON result (`session_id` required)
 - `POST /api/v1/tasks?stream=true` - execute a task in a session and stream output via SSE (`session_id` required)
 
-Example JSON task request (`session_id` is required):
+Working directory resolution order is:
+
+1. Task `working_dir`, when provided
+2. Session `working_dir`, when provided at session creation time
+3. Config `default_workdir`
+
+If a task `working_dir` is relative, it is resolved against the session `working_dir`.
+
+Example JSON task request (`session_id` is required, `working_dir` is an optional task-level override):
 
 ```json
 {
@@ -188,8 +196,11 @@ curl -N \
 Create and use a persistent session (filesystem changes survive between commands):
 
 ```bash
-# 1) Create session
-SESSION_ID=$(curl -sS -X POST "http://127.0.0.1:8080/api/v1/sessions" | jq -r '.session_id')
+# 1) Create session with a session-level working directory
+SESSION_ID=$(curl -sS \
+  -X POST "http://127.0.0.1:8080/api/v1/sessions" \
+  -H "Content-Type: application/json" \
+  -d '{"working_dir":"/workspace"}' | jq -r '.session_id')
 
 # 2) First command writes a file
 curl -sS \
@@ -210,16 +221,18 @@ curl -sS -X DELETE "http://127.0.0.1:8080/api/v1/sessions/${SESSION_ID}"
 ### Library API
 
 The library is session-only: create a session before execution, and close it when done.
+Task `working_dir` overrides the session `working_dir`; otherwise the session default is used.
 
 ```rust
-use apiary::{Pool, PoolConfig, Task};
+use apiary::{Pool, PoolConfig, SessionOptions, Task};
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Create configuration
     let config = PoolConfig::builder()
-        .pool_size(10)
+        .min_sandboxes(10)
+        .max_sandboxes(10)
         .base_image("./rootfs")
         .build()?;
 
@@ -231,7 +244,9 @@ async fn main() -> anyhow::Result<()> {
         .timeout(Duration::from_secs(30))
         .env("MY_VAR", "value");
 
-    let session_id = pool.create_session().await?;
+    let session_id = pool
+        .create_session_with_options(SessionOptions::default().working_dir("/workspace"))
+        .await?;
     let result = pool.execute_in_session(&session_id, task).await?;
     println!("Exit code: {}", result.exit_code);
     println!("Output: {}", result.stdout_lossy());
@@ -283,6 +298,9 @@ allow_unix_sockets = true
   }
 ]
 ```
+
+If `working_dir` is omitted, the task inherits the session `working_dir`. Relative
+task paths are resolved against the session `working_dir`.
 
 ## Architecture
 

@@ -12,7 +12,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use apiary::{Pool, PoolError, Task};
+use apiary::{Pool, PoolConfig, PoolError, SessionOptions, Task};
 
 #[derive(Clone)]
 struct AppState {
@@ -32,6 +32,12 @@ struct ExecuteTaskRequest {
     #[serde(default)]
     env: HashMap<String, String>,
     session_id: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CreateSessionRequest {
+    #[serde(default)]
+    working_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,11 +77,7 @@ struct ErrorResponse {
     error: String,
 }
 
-pub async fn run_server(
-    bind: String,
-    pool: Pool,
-    api_token: Option<String>,
-) -> anyhow::Result<()> {
+pub async fn run_server(bind: String, pool: Pool, api_token: Option<String>) -> anyhow::Result<()> {
     let state = AppState {
         pool,
         api_token: api_token.clone(),
@@ -165,10 +167,16 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
 
 async fn create_session(
     State(state): State<AppState>,
+    payload: Option<Json<CreateSessionRequest>>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
+    let payload = payload.map(|Json(payload)| payload).unwrap_or_default();
+    let session_options = payload
+        .working_dir
+        .map(|working_dir| SessionOptions::default().working_dir(working_dir))
+        .unwrap_or_default();
     let session_id = state
         .pool
-        .create_session()
+        .create_session_with_options(session_options)
         .await
         .map_err(ApiError::from_pool_error)?;
 
@@ -195,7 +203,7 @@ async fn execute_task(
     if session_id.is_empty() {
         return Err(ApiError::bad_request("session_id must not be empty"));
     }
-    let task = build_task(payload, &state.pool)?;
+    let task = build_task(payload, state.pool.config())?;
 
     let result = state
         .pool
@@ -219,7 +227,7 @@ async fn execute_task(
     .into_response())
 }
 
-fn build_task(payload: ExecuteTaskRequest, pool: &Pool) -> Result<Task, ApiError> {
+fn build_task(payload: ExecuteTaskRequest, config: &PoolConfig) -> Result<Task, ApiError> {
     let command = payload.command.trim();
     if command.is_empty() {
         return Err(ApiError::bad_request("command must not be empty"));
@@ -230,16 +238,16 @@ fn build_task(payload: ExecuteTaskRequest, pool: &Pool) -> Result<Task, ApiError
     } else if let Some(secs) = payload.timeout_secs {
         Duration::from_secs(secs)
     } else {
-        pool.config().default_timeout
+        config.default_timeout
     };
 
-    let mut env = pool.config().default_env.clone();
+    let mut env = config.default_env.clone();
     env.extend(payload.env);
 
-    let working_dir = payload
-        .working_dir
-        .unwrap_or_else(|| pool.config().default_workdir.clone());
-    let task = Task::new(command).timeout(timeout).envs(env).working_dir(working_dir);
+    let mut task = Task::new(command).timeout(timeout).envs(env);
+    if let Some(working_dir) = payload.working_dir {
+        task = task.working_dir(working_dir);
+    }
 
     Ok(task)
 }
@@ -293,5 +301,61 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> PoolConfig {
+        PoolConfig::builder()
+            .base_image("/tmp/rootfs")
+            .default_timeout(Duration::from_secs(42))
+            .default_workdir("/workspace/default")
+            .env("DEFAULT_KEY", "default-value")
+            .build()
+            .expect("config should build")
+    }
+
+    #[test]
+    fn build_task_leaves_working_dir_unset_without_override() {
+        let task = build_task(
+            ExecuteTaskRequest {
+                command: "echo hello".to_string(),
+                timeout_ms: None,
+                timeout_secs: None,
+                working_dir: None,
+                env: HashMap::new(),
+                session_id: "session-1".to_string(),
+            },
+            &test_config(),
+        )
+        .expect("task should build");
+
+        assert_eq!(task.working_dir, None);
+        assert_eq!(task.timeout, Duration::from_secs(42));
+        assert_eq!(
+            task.env.get("DEFAULT_KEY"),
+            Some(&"default-value".to_string())
+        );
+    }
+
+    #[test]
+    fn build_task_preserves_explicit_working_dir_override() {
+        let task = build_task(
+            ExecuteTaskRequest {
+                command: "echo hello".to_string(),
+                timeout_ms: None,
+                timeout_secs: None,
+                working_dir: Some(PathBuf::from("src")),
+                env: HashMap::new(),
+                session_id: "session-1".to_string(),
+            },
+            &test_config(),
+        )
+        .expect("task should build");
+
+        assert_eq!(task.working_dir, Some(PathBuf::from("src")));
     }
 }

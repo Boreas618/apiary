@@ -7,6 +7,7 @@
 //! pool back toward `min_sandboxes`.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,10 +69,45 @@ pub struct PoolStatus {
     pub avg_task_duration_ms: u64,
 }
 
+/// Options for creating a persistent session.
+#[derive(Debug, Clone, Default)]
+pub struct SessionOptions {
+    /// Default working directory for tasks executed in this session.
+    pub working_dir: Option<PathBuf>,
+}
+
+impl SessionOptions {
+    /// Set the session working directory.
+    pub fn working_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(path.into());
+        self
+    }
+}
+
 #[derive(Clone)]
 struct SessionHandle {
     sandbox_id: String,
+    working_dir: PathBuf,
     execution_lock: Arc<AsyncMutex<()>>,
+}
+
+fn normalize_session_working_dir(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Path::new("/").join(path)
+    }
+}
+
+fn resolve_task_working_dir(
+    session_working_dir: &Path,
+    task_working_dir: Option<&Path>,
+) -> PathBuf {
+    match task_working_dir {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => session_working_dir.join(path),
+        None => session_working_dir.to_path_buf(),
+    }
 }
 
 /// A sandbox pool that manages multiple sandboxes for task execution.
@@ -209,7 +245,9 @@ impl Pool {
                                 let sb_id = sb.id().to_string();
                                 let sb = Arc::new(sb);
                                 pool.sandboxes.write().insert(sb_id.clone(), sb);
-                                pool.idle_since.write().insert(sb_id.clone(), Instant::now());
+                                pool.idle_since
+                                    .write()
+                                    .insert(sb_id.clone(), Instant::now());
                                 pool.idle_queue.lock().push(sb_id.clone());
                                 pool.idle_notify.notify_one();
                                 tracing::info!(
@@ -231,7 +269,10 @@ impl Pool {
         }
 
         // At capacity: wait for an idle sandbox with timeout.
-        tracing::debug!("pool at max capacity ({}), waiting for idle sandbox", self.config.max_sandboxes);
+        tracing::debug!(
+            "pool at max capacity ({}), waiting for idle sandbox",
+            self.config.max_sandboxes
+        );
         let deadline = tokio::time::Instant::now() + SANDBOX_ACQUIRE_TIMEOUT;
 
         loop {
@@ -289,11 +330,26 @@ impl Pool {
     /// `max_sandboxes`).  Only when the hard cap is reached does the call
     /// block with a timeout.
     pub async fn create_session(&self) -> Result<String, PoolError> {
+        self.create_session_with_options(SessionOptions::default())
+            .await
+    }
+
+    /// Create a persistent session with explicit options.
+    pub async fn create_session_with_options(
+        &self,
+        options: SessionOptions,
+    ) -> Result<String, PoolError> {
         if self.shutdown.load(Ordering::Relaxed) {
             return Err(PoolError::ShuttingDown);
         }
 
         let sandbox = self.acquire_sandbox().await?;
+        let working_dir = normalize_session_working_dir(
+            options
+                .working_dir
+                .as_deref()
+                .unwrap_or(self.config.default_workdir.as_path()),
+        );
 
         let session_id = loop {
             let id = Uuid::new_v4().to_string();
@@ -306,11 +362,17 @@ impl Pool {
             session_id.clone(),
             SessionHandle {
                 sandbox_id: sandbox.id().to_string(),
+                working_dir: working_dir.clone(),
                 execution_lock: Arc::new(AsyncMutex::new(())),
             },
         );
 
-        tracing::info!(session_id = %session_id, sandbox_id = %sandbox.id(), "session created");
+        tracing::info!(
+            session_id = %session_id,
+            sandbox_id = %sandbox.id(),
+            working_dir = %working_dir.display(),
+            "session created"
+        );
         Ok(session_id)
     }
 
@@ -354,10 +416,12 @@ impl Pool {
             }
         }
 
-        sandbox
-            .execute(task)
-            .await
-            .map_err(PoolError::SandboxError)
+        let mut task = task;
+        let resolved_working_dir =
+            resolve_task_working_dir(&session.working_dir, task.working_dir.as_deref());
+        task.working_dir = Some(resolved_working_dir);
+
+        sandbox.execute(task).await.map_err(PoolError::SandboxError)
     }
 
     /// Close a persistent session, reset its sandbox, and return it to the idle pool.
@@ -656,9 +720,7 @@ impl Pool {
         match self.create_sandbox().await {
             Ok(sb) => {
                 let id = sb.id().to_string();
-                self.sandboxes
-                    .write()
-                    .insert(id.clone(), Arc::new(sb));
+                self.sandboxes.write().insert(id.clone(), Arc::new(sb));
                 self.return_to_idle(&id);
                 *self.last_scale_event.lock() = Instant::now();
 
@@ -684,6 +746,7 @@ impl Drop for Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn test_pool_status_default() {
@@ -704,5 +767,35 @@ mod tests {
         assert_eq!(status.total, status.idle + status.reserved + status.error);
         assert!(status.busy <= status.total);
         assert!(status.min_sandboxes <= status.max_sandboxes);
+    }
+
+    #[test]
+    fn test_normalize_session_working_dir_makes_paths_absolute() {
+        assert_eq!(
+            normalize_session_working_dir(Path::new("/workspace/project")),
+            PathBuf::from("/workspace/project")
+        );
+        assert_eq!(
+            normalize_session_working_dir(Path::new("workspace/project")),
+            PathBuf::from("/workspace/project")
+        );
+    }
+
+    #[test]
+    fn test_resolve_task_working_dir_prefers_task_override() {
+        let session_working_dir = Path::new("/workspace/project");
+
+        assert_eq!(
+            resolve_task_working_dir(session_working_dir, None),
+            PathBuf::from("/workspace/project")
+        );
+        assert_eq!(
+            resolve_task_working_dir(session_working_dir, Some(Path::new("src"))),
+            PathBuf::from("/workspace/project/src")
+        );
+        assert_eq!(
+            resolve_task_working_dir(session_working_dir, Some(Path::new("/tmp"))),
+            PathBuf::from("/tmp")
+        );
     }
 }

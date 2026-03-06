@@ -19,8 +19,12 @@ pub struct Task {
     #[serde(default)]
     pub env: HashMap<String, String>,
 
-    /// Working directory inside the sandbox.
-    pub working_dir: PathBuf,
+    /// Optional task-level working directory override inside the sandbox.
+    ///
+    /// When unset, execution inherits the session working directory. Relative
+    /// paths are resolved against the session working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<PathBuf>,
 
     /// Timeout for the task.
     #[serde(with = "duration_millis_serde")]
@@ -87,7 +91,7 @@ impl Task {
             id: Uuid::new_v4().to_string(),
             command: shell_words::split(command).unwrap_or_else(|_| vec![command.to_string()]),
             env: HashMap::new(),
-            working_dir: PathBuf::from("/workspace"),
+            working_dir: None,
             timeout: Duration::from_secs(300),
             writable_mounts: Vec::new(),
             readonly_mounts: Vec::new(),
@@ -110,7 +114,7 @@ impl Task {
             id: Uuid::new_v4().to_string(),
             command,
             env: HashMap::new(),
-            working_dir: PathBuf::from("/workspace"),
+            working_dir: None,
             timeout: Duration::from_secs(300),
             writable_mounts: Vec::new(),
             readonly_mounts: Vec::new(),
@@ -143,7 +147,7 @@ impl Task {
 
     /// Set the working directory.
     pub fn working_dir(mut self, path: impl Into<PathBuf>) -> Self {
-        self.working_dir = path.into();
+        self.working_dir = Some(path.into());
         self
     }
 
@@ -246,9 +250,7 @@ impl TaskBuilder {
     /// Set the command.
     pub fn command(mut self, command: impl Into<String>) -> Self {
         let cmd = command.into();
-        self.command = Some(
-            shell_words::split(&cmd).unwrap_or_else(|_| vec![cmd]),
-        );
+        self.command = Some(shell_words::split(&cmd).unwrap_or_else(|_| vec![cmd]));
         self
     }
 
@@ -295,11 +297,7 @@ impl TaskBuilder {
     }
 
     /// Add a writable mount.
-    pub fn writable_mount(
-        mut self,
-        source: impl Into<PathBuf>,
-        dest: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn writable_mount(mut self, source: impl Into<PathBuf>, dest: impl Into<PathBuf>) -> Self {
         self.writable_mounts.push(MountSpec {
             source: source.into(),
             dest: dest.into(),
@@ -308,11 +306,7 @@ impl TaskBuilder {
     }
 
     /// Add a read-only mount.
-    pub fn readonly_mount(
-        mut self,
-        source: impl Into<PathBuf>,
-        dest: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn readonly_mount(mut self, source: impl Into<PathBuf>, dest: impl Into<PathBuf>) -> Self {
         self.readonly_mounts.push(MountSpec {
             source: source.into(),
             dest: dest.into(),
@@ -370,7 +364,7 @@ impl TaskBuilder {
             id: self.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
             command,
             env: self.env,
-            working_dir: self.working_dir.unwrap_or_else(|| PathBuf::from("/workspace")),
+            working_dir: self.working_dir,
             timeout: self.timeout.unwrap_or(Duration::from_secs(300)),
             writable_mounts: self.writable_mounts,
             readonly_mounts: self.readonly_mounts,
@@ -463,12 +457,14 @@ mod tests {
     fn test_task_new() {
         let task = Task::new("echo hello world");
         assert_eq!(task.command, vec!["echo", "hello", "world"]);
+        assert_eq!(task.working_dir, None);
     }
 
     #[test]
     fn test_task_with_args() {
         let task = Task::with_args("ls", ["-la", "/tmp"]);
         assert_eq!(task.command, vec!["ls", "-la", "/tmp"]);
+        assert_eq!(task.working_dir, None);
     }
 
     #[test]
@@ -483,7 +479,7 @@ mod tests {
 
         assert_eq!(task.command[0], "python");
         assert_eq!(task.timeout, Duration::from_secs(60));
-        assert_eq!(task.working_dir, PathBuf::from("/home/user"));
+        assert_eq!(task.working_dir, Some(PathBuf::from("/home/user")));
         assert_eq!(task.env.get("PYTHONPATH"), Some(&"/app".to_string()));
     }
 

@@ -5,10 +5,13 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod api;
 
-
 #[derive(Parser)]
 #[command(name = "apiary")]
-#[command(author, version, about = "A lightweight sandbox pool for running tasks with isolation")]
+#[command(
+    author,
+    version,
+    about = "A lightweight sandbox pool for running tasks with isolation"
+)]
 struct Cli {
     /// Config file path
     #[arg(short, long, global = true)]
@@ -80,7 +83,7 @@ enum Commands {
         #[arg(long, default_value = "60")]
         timeout: u64,
 
-        /// Working directory inside the sandbox
+        /// Default session working directory inside the sandbox
         #[arg(long)]
         workdir: Option<PathBuf>,
 
