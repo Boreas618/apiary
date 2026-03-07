@@ -212,5 +212,4 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         assert!(matches!(arch, TargetArch::aarch64));
     }
-
 }

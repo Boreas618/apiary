@@ -12,6 +12,8 @@ use super::SandboxError;
 use crate::config::ResourceLimits;
 
 const CGROUP_V2_BASE: &str = "/sys/fs/cgroup";
+const CGROUP_REMOVE_MAX_RETRIES: usize = 10;
+const CGROUP_REMOVE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Setup a cgroup for a sandbox.
 pub fn setup_cgroup(sandbox_id: &str, limits: &ResourceLimits) -> Result<PathBuf, SandboxError> {
@@ -183,11 +185,11 @@ pub fn kill_cgroup_processes(cgroup_path: &Path) -> Result<(), SandboxError> {
 pub fn remove_cgroup(cgroup_path: &Path) -> Result<(), SandboxError> {
     let _ = kill_cgroup_processes(cgroup_path);
 
-    for _ in 0..10 {
+    for _ in 0..CGROUP_REMOVE_MAX_RETRIES {
         match fs::remove_dir(cgroup_path) {
             Ok(()) => return Ok(()),
             Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(CGROUP_REMOVE_RETRY_DELAY);
             }
             Err(e) => {
                 return Err(SandboxError::CgroupSetup(format!(

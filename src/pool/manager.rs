@@ -28,6 +28,9 @@ const SANDBOX_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often the background scaler wakes up.
 const SCALER_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Maximum time to wait for busy sandboxes to finish during shutdown.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Errors that can occur during pool operations.
 #[derive(Debug, Error)]
 pub enum PoolError {
@@ -498,7 +501,6 @@ impl Pool {
     pub fn status(&self) -> PoolStatus {
         let sandboxes = self.sandboxes.read();
         let idle_count = self.idle_queue.lock().len();
-        let reserved_count = self.sessions.read().len();
 
         let mut busy = 0;
         let mut error = 0;
@@ -527,11 +529,13 @@ impl Pool {
             0
         };
 
+        let total = sandboxes.len();
+
         PoolStatus {
-            total: sandboxes.len(),
+            total,
             idle: idle_count,
             busy,
-            reserved: reserved_count,
+            reserved: total.saturating_sub(idle_count + busy + error),
             error,
             min_sandboxes: self.config.min_sandboxes,
             max_sandboxes: self.config.max_sandboxes,
@@ -558,10 +562,9 @@ impl Pool {
             }
         }
 
-        let timeout = Duration::from_secs(30);
         let start = Instant::now();
 
-        while start.elapsed() < timeout {
+        while start.elapsed() < SHUTDOWN_TIMEOUT {
             let status = self.status();
             if status.busy == 0 {
                 break;

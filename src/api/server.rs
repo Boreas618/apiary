@@ -72,7 +72,7 @@ pub async fn run_server(bind: String, pool: Pool, api_token: Option<String>) -> 
         .route("/api/v1/status", get(status))
         .route("/api/v1/tasks", post(execute_task))
         .route("/api/v1/sessions", post(create_session))
-        .route("/api/v1/sessions/:session_id", delete(close_session))
+        .route("/api/v1/sessions/{session_id}", delete(close_session))
         .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
 
     let app = Router::new()

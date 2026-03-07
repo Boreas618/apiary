@@ -347,8 +347,10 @@ impl TaskBuilder {
     }
 
     /// Build the task.
-    pub fn build(self) -> Result<Task, &'static str> {
-        let command = self.command.ok_or("command is required")?;
+    pub fn build(self) -> anyhow::Result<Task> {
+        let command = self
+            .command
+            .ok_or_else(|| anyhow::anyhow!("command is required"))?;
 
         Ok(Task {
             id: self.id.unwrap_or_else(|| Uuid::new_v4().to_string()),

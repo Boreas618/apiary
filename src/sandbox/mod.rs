@@ -15,6 +15,8 @@ use std::time::Instant;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
+const OUTPUT_READ_BUFFER_SIZE: usize = 8192;
+
 /// Errors that can occur during sandbox operations.
 #[derive(Debug, Error)]
 pub enum SandboxError {
@@ -619,7 +621,7 @@ where
     };
 
     let mut captured = Vec::new();
-    let mut buffer = [0_u8; 8192];
+    let mut buffer = [0_u8; OUTPUT_READ_BUFFER_SIZE];
     let mut truncated = false;
 
     loop {

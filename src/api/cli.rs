@@ -129,17 +129,13 @@ pub async fn run_task(
     enable_seccomp: bool,
 ) -> anyhow::Result<()> {
     let (config, _) = load_config(config_path, enable_seccomp)?;
-    let pool = Pool::new(config.clone()).await?;
+    let pool = Pool::new(config).await?;
 
     let env_map: HashMap<String, String> = env
         .iter()
         .filter_map(|s| {
-            let parts: Vec<&str> = s.splitn(2, '=').collect();
-            if parts.len() == 2 {
-                Some((parts[0].to_string(), parts[1].to_string()))
-            } else {
-                None
-            }
+            let (key, value) = s.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
         })
         .collect();
 
