@@ -91,8 +91,8 @@ fn read_current_cgroup() -> Result<String, SandboxError> {
         .map_err(|e| SandboxError::CgroupSetup(format!("failed to read /proc/self/cgroup: {e}")))?;
 
     for line in content.lines() {
-        if line.starts_with("0::") {
-            return Ok(line[3..].to_string());
+        if let Some(path) = line.strip_prefix("0::") {
+            return Ok(path.to_string());
         }
     }
 

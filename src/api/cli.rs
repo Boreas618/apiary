@@ -150,38 +150,14 @@ pub async fn run_task(
     let session_options = workdir
         .map(|dir| SessionOptions::default().working_dir(dir))
         .unwrap_or_default();
-    let session_result = pool.create_session(session_options).await;
-    let session_id = match session_result {
-        Ok(session_id) => session_id,
-        Err(error) => {
-            pool.shutdown().await;
-            return Err(error.into());
-        }
-    };
-    tracing::info!(session_id = %session_id, "Created CLI session");
-    tracing::info!("Executing in session {session_id}: {command}");
 
-    let execution_result = pool.execute_in_session(&session_id, task).await;
-    let close_result = pool.close_session(&session_id).await;
-    let result = match (execution_result, close_result) {
-        (Ok(result), Ok(())) => Ok(result),
-        (Ok(_), Err(close_error)) => Err(anyhow::Error::from(close_error)),
-        (Err(exec_error), Ok(())) => Err(anyhow::Error::from(exec_error)),
-        (Err(exec_error), Err(close_error)) => {
-            tracing::error!(
-                %close_error,
-                session_id = %session_id,
-                "Failed to close CLI session after task error"
-            );
-            Err(anyhow::Error::from(exec_error))
-        }
-    };
+    tracing::info!("Executing: {command}");
 
-    let result = match result {
+    let result = match pool.run_task(task, session_options).await {
         Ok(result) => result,
         Err(error) => {
             pool.shutdown().await;
-            return Err(error);
+            return Err(error.into());
         }
     };
 
@@ -242,27 +218,7 @@ pub async fn run_batch(
     let results: Vec<Result<apiary::TaskResult, PoolError>> =
         stream::iter(tasks.into_iter().map(|task| {
             let pool = pool.clone();
-            async move {
-                let session_id = pool.create_session(SessionOptions::default()).await?;
-                let execution_result = pool.execute_in_session(&session_id, task).await;
-                let close_result = pool.close_session(&session_id).await;
-
-                match close_result {
-                    Ok(()) => execution_result,
-                    Err(close_error) => {
-                        if execution_result.is_ok() {
-                            Err(close_error)
-                        } else {
-                            tracing::error!(
-                                %close_error,
-                                session_id = %session_id,
-                                "Failed to close batch session after task error"
-                            );
-                            execution_result
-                        }
-                    }
-                }
-            }
+            async move { pool.run_task(task, SessionOptions::default()).await }
         }))
         .buffer_unordered(parallelism)
         .collect()

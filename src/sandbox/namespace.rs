@@ -348,12 +348,6 @@ pub fn pivot_root(new_root: &Path, put_old: &Path) -> Result<(), SandboxError> {
         .map_err(|e| SandboxError::NamespaceCreation(format!("failed to chdir to /: {e}")))
 }
 
-/// Set the hostname inside a UTS namespace.
-pub fn set_hostname(hostname: &str) -> Result<(), SandboxError> {
-    nix::unistd::sethostname(hostname)
-        .map_err(|e| SandboxError::NamespaceCreation(format!("failed to set hostname: {e}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

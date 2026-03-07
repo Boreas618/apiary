@@ -147,7 +147,7 @@ impl Sandbox {
     /// Initialize the sandbox.
     pub async fn initialize(
         &mut self,
-        base_image: &PathBuf,
+        base_image: &Path,
         driver: &overlay::OverlayDriver,
     ) -> Result<(), SandboxError> {
         self.set_state(SandboxState::Creating);

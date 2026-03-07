@@ -54,7 +54,7 @@ pub enum PoolError {
 }
 
 /// Status of the pool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PoolStatus {
     pub total: usize,
     pub idle: usize,
@@ -461,6 +461,36 @@ impl Pool {
         }
     }
 
+    /// Run a task in an ephemeral session: create a session, execute the
+    /// task, then close the session regardless of outcome.
+    ///
+    /// This is a convenience wrapper around [`create_session`] +
+    /// [`execute_in_session`] + [`close_session`] that handles the
+    /// lifecycle and error priority automatically.
+    pub async fn run_task(
+        &self,
+        task: Task,
+        options: SessionOptions,
+    ) -> Result<TaskResult, PoolError> {
+        let session_id = self.create_session(options).await?;
+        let exec_result = self.execute_in_session(&session_id, task).await;
+        let close_result = self.close_session(&session_id).await;
+
+        match (exec_result, close_result) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Ok(_), Err(close_err)) => Err(close_err),
+            (Err(exec_err), Ok(())) => Err(exec_err),
+            (Err(exec_err), Err(close_err)) => {
+                tracing::error!(
+                    %close_err,
+                    session_id = %session_id,
+                    "failed to close session after task error"
+                );
+                Err(exec_err)
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Status / config
     // ------------------------------------------------------------------
@@ -545,27 +575,6 @@ impl Pool {
         }
 
         tracing::info!("Pool shutdown complete");
-    }
-
-    pub async fn wait_for_idle(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let notified = self.idle_notify.notified();
-
-            if !self.idle_queue.lock().is_empty() {
-                return true;
-            }
-
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-
-            let wait_duration = deadline.saturating_duration_since(now);
-            if tokio::time::timeout(wait_duration, notified).await.is_err() {
-                return false;
-            }
-        }
     }
 
     // ------------------------------------------------------------------

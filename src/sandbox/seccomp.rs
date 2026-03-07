@@ -193,14 +193,6 @@ pub fn set_no_new_privs() -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// Check if seccomp is available on this system.
-pub fn is_seccomp_available() -> bool {
-    // Try to check if seccomp is available by querying the kernel
-    let result = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) };
-    // Returns 0 if seccomp is disabled, 2 if in filter mode, -1 with EINVAL if not supported
-    result >= 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,8 +213,4 @@ mod tests {
         assert!(matches!(arch, TargetArch::aarch64));
     }
 
-    #[test]
-    fn test_seccomp_available() {
-        let _ = is_seccomp_available();
-    }
 }

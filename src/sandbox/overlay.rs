@@ -445,29 +445,6 @@ pub fn clear_upper_layer(upper: &Path) -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// Get the disk usage of an overlay upper layer.
-pub fn get_upper_layer_size(upper: &Path) -> Result<u64, SandboxError> {
-    fn dir_size(path: &Path) -> std::io::Result<u64> {
-        let mut size = 0;
-        if path.is_dir() {
-            for entry in std::fs::read_dir(path)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() {
-                    size += dir_size(&path)?;
-                } else {
-                    size += entry.metadata()?.len();
-                }
-            }
-        }
-        Ok(size)
-    }
-
-    dir_size(upper).map_err(|e| {
-        SandboxError::OverlaySetup(format!("failed to calculate upper layer size: {e}"))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

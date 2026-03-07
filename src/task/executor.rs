@@ -85,31 +85,7 @@ pub struct MountSpec {
 }
 
 impl Task {
-    /// Create a new task with a command string.
-    pub fn new(command: &str) -> Self {
-        Self {
-            id: Uuid::new_v4().to_string(),
-            command: shell_words::split(command).unwrap_or_else(|_| vec![command.to_string()]),
-            env: HashMap::new(),
-            working_dir: None,
-            timeout: Duration::from_secs(300),
-            writable_mounts: Vec::new(),
-            readonly_mounts: Vec::new(),
-            uid: None,
-            gid: None,
-            capture_stdout: true,
-            capture_stderr: true,
-            max_output_size: default_max_output(),
-            stdin: None,
-            metadata: HashMap::new(),
-        }
-    }
-
-    /// Create a new task with a command and arguments.
-    pub fn with_args<S: AsRef<str>>(program: &str, args: impl IntoIterator<Item = S>) -> Self {
-        let mut command = vec![program.to_string()];
-        command.extend(args.into_iter().map(|s| s.as_ref().to_string()));
-
+    fn with_command(command: Vec<String>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             command,
@@ -126,6 +102,20 @@ impl Task {
             stdin: None,
             metadata: HashMap::new(),
         }
+    }
+
+    /// Create a new task with a command string.
+    pub fn new(command: &str) -> Self {
+        Self::with_command(
+            shell_words::split(command).unwrap_or_else(|_| vec![command.to_string()]),
+        )
+    }
+
+    /// Create a new task with a command and arguments.
+    pub fn with_args<S: AsRef<str>>(program: &str, args: impl IntoIterator<Item = S>) -> Self {
+        let mut command = vec![program.to_string()];
+        command.extend(args.into_iter().map(|s| s.as_ref().to_string()));
+        Self::with_command(command)
     }
 
     /// Create a builder for constructing tasks.

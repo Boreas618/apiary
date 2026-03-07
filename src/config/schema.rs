@@ -323,29 +323,15 @@ impl PoolConfigBuilder {
     }
 
     pub fn build(self) -> anyhow::Result<PoolConfig> {
-        let base_image = self
-            .base_image
-            .ok_or_else(|| anyhow::anyhow!("base_image is required"))?;
-
-        let min_sandboxes = self.min_sandboxes.unwrap_or_else(default_min_sandboxes);
-        if min_sandboxes == 0 {
-            anyhow::bail!("min_sandboxes must be at least 1");
-        }
-
-        let max_sandboxes = self.max_sandboxes.unwrap_or_else(default_max_sandboxes);
-        if max_sandboxes < min_sandboxes {
-            anyhow::bail!(
-                "max_sandboxes ({max_sandboxes}) must be >= min_sandboxes ({min_sandboxes})"
-            );
-        }
-
-        Ok(PoolConfig {
-            min_sandboxes,
-            max_sandboxes,
+        let config = PoolConfig {
+            min_sandboxes: self.min_sandboxes.unwrap_or_else(default_min_sandboxes),
+            max_sandboxes: self.max_sandboxes.unwrap_or_else(default_max_sandboxes),
             scale_up_step: self.scale_up_step.unwrap_or_else(default_scale_up_step),
             idle_timeout: self.idle_timeout.unwrap_or_else(default_idle_timeout),
             cooldown: self.cooldown.unwrap_or_else(default_cooldown),
-            base_image,
+            base_image: self
+                .base_image
+                .ok_or_else(|| anyhow::anyhow!("base_image is required"))?,
             overlay_dir: self
                 .overlay_dir
                 .unwrap_or_else(super::PoolConfig::default_overlay_dir),
@@ -356,7 +342,9 @@ impl PoolConfigBuilder {
             default_timeout: self.default_timeout.unwrap_or_else(default_timeout),
             default_workdir: self.default_workdir.unwrap_or_else(default_workdir),
             default_env: self.default_env.unwrap_or_default(),
-        })
+        };
+        config.validate()?;
+        Ok(config)
     }
 }
 

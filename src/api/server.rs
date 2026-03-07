@@ -12,7 +12,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use apiary::{Pool, PoolConfig, PoolError, SessionOptions, Task};
+use apiary::{Pool, PoolConfig, PoolError, PoolStatus, SessionOptions, Task};
 
 #[derive(Clone)]
 struct AppState {
@@ -50,21 +50,6 @@ struct ExecuteTaskResponse {
     success: bool,
     stdout: String,
     stderr: String,
-}
-
-#[derive(Debug, Serialize)]
-struct StatusResponse {
-    total: usize,
-    idle: usize,
-    busy: usize,
-    reserved: usize,
-    error: usize,
-    min_sandboxes: usize,
-    max_sandboxes: usize,
-    tasks_executed: u64,
-    tasks_succeeded: u64,
-    tasks_failed: u64,
-    avg_task_duration_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -160,21 +145,8 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
-    let status = state.pool.status();
-    Json(StatusResponse {
-        total: status.total,
-        idle: status.idle,
-        busy: status.busy,
-        reserved: status.reserved,
-        error: status.error,
-        min_sandboxes: status.min_sandboxes,
-        max_sandboxes: status.max_sandboxes,
-        tasks_executed: status.tasks_executed,
-        tasks_succeeded: status.tasks_succeeded,
-        tasks_failed: status.tasks_failed,
-        avg_task_duration_ms: status.avg_task_duration_ms,
-    })
+async fn status(State(state): State<AppState>) -> Json<PoolStatus> {
+    Json(state.pool.status())
 }
 
 async fn create_session(

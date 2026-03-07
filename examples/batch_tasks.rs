@@ -69,31 +69,11 @@ async fn async_main() -> anyhow::Result<()> {
     println!("Submitting {} tasks...", tasks.len());
     println!();
 
-    // Execute all tasks in parallel (each task gets its own session).
+    // Execute all tasks in parallel (each task gets its own ephemeral session).
     let start = std::time::Instant::now();
     let results = futures::future::join_all(tasks.into_iter().map(|task| {
         let pool = pool.clone();
-        async move {
-            let session_id = pool.create_session(SessionOptions::default()).await?;
-            let execution_result = pool.execute_in_session(&session_id, task).await;
-            let close_result = pool.close_session(&session_id).await;
-
-            match close_result {
-                Ok(()) => execution_result,
-                Err(close_error) => {
-                    if execution_result.is_ok() {
-                        Err(close_error)
-                    } else {
-                        tracing::error!(
-                            %close_error,
-                            session_id = %session_id,
-                            "failed to close session after task error"
-                        );
-                        execution_result
-                    }
-                }
-            }
-        }
+        async move { pool.run_task(task, SessionOptions::default()).await }
     }))
     .await;
     let elapsed = start.elapsed();
