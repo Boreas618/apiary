@@ -53,7 +53,14 @@ impl SandboxError {
     /// Whether this error indicates the sandbox infrastructure itself is broken
     /// (as opposed to a task-level failure like timeout or output capture issue).
     pub fn is_sandbox_broken(&self) -> bool {
-        matches!(self, Self::SpawnFailed(_))
+        matches!(
+            self,
+            Self::SpawnFailed(_)
+                | Self::NamespaceCreation(_)
+                | Self::OverlaySetup(_)
+                | Self::CgroupSetup(_)
+                | Self::SeccompFilter(_)
+        )
     }
 }
 
@@ -133,7 +140,7 @@ impl Sandbox {
         *self.state.lock() = state;
     }
 
-    pub fn root_path(&self) -> &PathBuf {
+    pub fn root_path(&self) -> &Path {
         &self.root_path
     }
 
@@ -287,11 +294,9 @@ impl Sandbox {
             });
         }
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| SandboxError::SpawnFailed(format!("failed to spawn process: {e}")))?;
-
-        let mut child = child;
         if let Some(pid) = child.id() {
             *self.init_pid.lock() = Some(nix::unistd::Pid::from_raw(pid as i32));
         }
@@ -374,13 +379,6 @@ impl Sandbox {
             if task.capture_stderr {
                 append_capped(&mut stderr, timeout_msg, task.max_output_size);
             }
-        }
-
-        if !task.capture_stdout {
-            stdout.clear();
-        }
-        if !task.capture_stderr {
-            stderr.clear();
         }
 
         Ok(TaskResult {
@@ -476,7 +474,7 @@ fn configure_task_process_linux(
     }
 
     if let Some(cgroup_path) = cgroup_path {
-        if let Err(_) = cgroup::add_process_to_cgroup(cgroup_path, std::process::id()) {
+        if cgroup::add_process_to_cgroup(cgroup_path, std::process::id()).is_err() {
             write_stderr_safe(b"[apiary] warning: failed to attach process to cgroup\n");
         }
     }
@@ -496,7 +494,7 @@ fn configure_task_process_linux(
 
     apply_task_mounts(root, writable_mounts, readonly_mounts)?;
 
-    if let Err(_) = overlay::setup_dev_mounts(root) {
+    if overlay::setup_dev_mounts(root).is_err() {
         write_stderr_safe(b"[apiary] warning: failed to setup /dev; continuing\n");
     }
 
@@ -507,7 +505,7 @@ fn configure_task_process_linux(
         .map_err(|e| std::io::Error::other(format!("failed to unmount old root: {e}")))?;
     let _ = std::fs::remove_dir_all("/.old_root");
 
-    if let Err(_) = overlay::setup_post_pivot_mounts(Path::new("/")) {
+    if overlay::setup_post_pivot_mounts(Path::new("/")).is_err() {
         write_stderr_safe(b"[apiary] warning: failed to mount pseudo-filesystems; continuing\n");
     }
 
@@ -531,11 +529,11 @@ fn configure_task_process_linux(
     }
 
     if enable_seccomp {
-        if let Err(_) = seccomp::set_no_new_privs() {
+        if seccomp::set_no_new_privs().is_err() {
             write_stderr_safe(
                 b"[apiary] warning: failed to set no_new_privs; continuing without seccomp\n",
             );
-        } else if let Err(_) = seccomp::apply_seccomp_filter(seccomp_policy) {
+        } else if seccomp::apply_seccomp_filter(seccomp_policy).is_err() {
             write_stderr_safe(b"[apiary] warning: failed to apply seccomp filter; continuing\n");
         }
     }
@@ -548,56 +546,44 @@ fn apply_task_mounts(
     writable_mounts: &[MountSpec],
     readonly_mounts: &[MountSpec],
 ) -> std::io::Result<()> {
+    for spec in writable_mounts {
+        bind_mount_spec(root, spec, false)?;
+    }
+    for spec in readonly_mounts {
+        bind_mount_spec(root, spec, true)?;
+    }
+    Ok(())
+}
+
+fn bind_mount_spec(root: &Path, spec: &MountSpec, readonly: bool) -> std::io::Result<()> {
     use nix::mount::{mount, MsFlags};
 
-    for spec in writable_mounts {
-        if !spec.source.exists() {
-            return Err(std::io::Error::other(format!(
-                "writable mount source does not exist: {}",
-                spec.source.display()
-            )));
-        }
-        let target = root.join(spec.dest.strip_prefix("/").unwrap_or(&spec.dest));
-        std::fs::create_dir_all(&target)?;
-        mount(
-            Some(&spec.source),
-            &target,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            std::io::Error::other(format!(
-                "failed to bind mount {} -> {}: {e}",
-                spec.source.display(),
-                spec.dest.display()
-            ))
-        })?;
+    if !spec.source.exists() {
+        return Err(std::io::Error::other(format!(
+            "mount source does not exist: {}",
+            spec.source.display()
+        )));
     }
 
-    for spec in readonly_mounts {
-        if !spec.source.exists() {
-            return Err(std::io::Error::other(format!(
-                "readonly mount source does not exist: {}",
-                spec.source.display()
-            )));
-        }
-        let target = root.join(spec.dest.strip_prefix("/").unwrap_or(&spec.dest));
-        std::fs::create_dir_all(&target)?;
-        mount(
-            Some(&spec.source),
-            &target,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            std::io::Error::other(format!(
-                "failed to bind mount {} -> {}: {e}",
-                spec.source.display(),
-                spec.dest.display()
-            ))
-        })?;
+    let target = root.join(spec.dest.strip_prefix("/").unwrap_or(&spec.dest));
+    std::fs::create_dir_all(&target)?;
+
+    mount(
+        Some(&spec.source),
+        &target,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(|e| {
+        std::io::Error::other(format!(
+            "failed to bind mount {} -> {}: {e}",
+            spec.source.display(),
+            spec.dest.display()
+        ))
+    })?;
+
+    if readonly {
         mount(
             None::<&str>,
             &target,

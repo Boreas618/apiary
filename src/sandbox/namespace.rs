@@ -20,7 +20,7 @@ pub fn original_uid() -> u32 {
 /// meaning it is running inside a user namespace with a non-root original UID.
 pub fn is_rootless_mode() -> bool {
     let stored = ORIGINAL_UID.load(std::sync::atomic::Ordering::Relaxed);
-    stored != u32::MAX && stored != 0
+    stored != u32::MAX
 }
 
 static ORIGINAL_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
@@ -31,15 +31,6 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
-
-/// Create namespaces for the sandbox child process (called from pre_exec).
-/// Unshares mount, IPC, and UTS namespaces for the current process.
-pub fn unshare_task_namespaces() -> Result<(), SandboxError> {
-    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS)
-        .map_err(|e| {
-            SandboxError::NamespaceCreation(format!("failed to unshare task namespaces: {e}"))
-        })
-}
 
 #[derive(Debug, Clone, Copy)]
 enum IdMapKind {

@@ -41,24 +41,22 @@ fn build_filter(policy: &SeccompPolicy) -> Result<SeccompFilter, SandboxError> {
         }
     }
 
-    if policy.block_network && !policy.allowed_syscalls.is_empty() {
-        let network_syscalls = [
-            "socket", "socketpair", "connect", "accept", "accept4", "bind", "listen", "sendto",
-            "sendmsg", "sendmmsg", "recvfrom", "recvmsg", "recvmmsg", "shutdown", "getsockname",
-            "getpeername", "getsockopt", "setsockopt",
-        ];
-        for name in &policy.allowed_syscalls {
-            let lower = name.to_lowercase();
-            if network_syscalls.contains(&lower.as_str()) {
-                tracing::warn!(
-                    syscall = %name,
-                    "allowed_syscalls contains a network syscall, undermining block_network"
-                );
-            }
-        }
-    }
+    let network_syscalls = [
+        "socket", "socketpair", "connect", "accept", "accept4", "bind", "listen", "sendto",
+        "sendmsg", "sendmmsg", "recvfrom", "recvmsg", "recvmmsg", "shutdown", "getsockname",
+        "getpeername", "getsockopt", "setsockopt",
+    ];
 
     for syscall_name in &policy.allowed_syscalls {
+        if policy.block_network {
+            let lower = syscall_name.to_lowercase();
+            if network_syscalls.contains(&lower.as_str()) {
+                return Err(SandboxError::SeccompFilter(format!(
+                    "allowed_syscalls contains network syscall '{syscall_name}' \
+                     which conflicts with block_network=true"
+                )));
+            }
+        }
         if let Some(nr) = syscall_number(syscall_name) {
             rules.remove(&nr);
         }

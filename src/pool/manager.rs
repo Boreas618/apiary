@@ -626,32 +626,20 @@ impl Pool {
         });
     }
 
+    fn cooldown_elapsed(&self) -> bool {
+        self.last_scale_event.lock().elapsed() >= self.config.cooldown
+    }
+
     async fn scaler_tick(&self) {
         let total = self.sandboxes.read().len();
         let idle_count = self.idle_queue.lock().len();
 
-        // --- Scale down ---
-        if total > self.config.min_sandboxes && idle_count > 0 {
-            let cooldown_ok = {
-                let last = *self.last_scale_event.lock();
-                last.elapsed() >= self.config.cooldown
-            };
-
-            if cooldown_ok {
-                self.try_scale_down(total);
-            }
+        if total > self.config.min_sandboxes && idle_count > 0 && self.cooldown_elapsed() {
+            self.try_scale_down(total);
         }
 
-        // --- Proactive scale up ---
-        if idle_count == 0 && total < self.config.max_sandboxes {
-            let cooldown_ok = {
-                let last = *self.last_scale_event.lock();
-                last.elapsed() >= self.config.cooldown
-            };
-
-            if cooldown_ok {
-                self.try_proactive_scale_up(total).await;
-            }
+        if idle_count == 0 && total < self.config.max_sandboxes && self.cooldown_elapsed() {
+            self.try_proactive_scale_up(total).await;
         }
     }
 
@@ -741,7 +729,7 @@ mod tests {
     #[test]
     fn test_pool_status_default() {
         let status = PoolStatus {
-            total: 10,
+            total: 12,
             idle: 8,
             busy: 2,
             reserved: 2,
@@ -754,7 +742,10 @@ mod tests {
             avg_task_duration_ms: 500,
         };
 
-        assert_eq!(status.total, status.idle + status.reserved + status.error);
+        assert_eq!(
+            status.total,
+            status.idle + status.busy + status.reserved + status.error
+        );
         assert!(status.busy <= status.total);
         assert!(status.min_sandboxes <= status.max_sandboxes);
     }

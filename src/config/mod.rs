@@ -25,7 +25,7 @@ impl PoolConfig {
 
     /// Get the default config file path.
     pub fn default_config_path() -> std::path::PathBuf {
-        dirs::config_dir()
+        xdg_config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("apiary")
             .join("config.toml")
@@ -36,7 +36,7 @@ impl PoolConfig {
         if let Ok(dir) = std::env::var("APIARY_OVERLAY_DIR") {
             return std::path::PathBuf::from(dir);
         }
-        dirs::data_local_dir()
+        xdg_data_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("apiary")
             .join("overlays")
@@ -48,7 +48,7 @@ impl PoolConfig {
     }
 }
 
-fn dirs_config_dir() -> Option<std::path::PathBuf> {
+fn xdg_config_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -56,20 +56,10 @@ fn dirs_config_dir() -> Option<std::path::PathBuf> {
         })
 }
 
-fn dirs_data_local_dir() -> Option<std::path::PathBuf> {
+fn xdg_data_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
         })
-}
-
-mod dirs {
-    pub fn config_dir() -> Option<std::path::PathBuf> {
-        super::dirs_config_dir()
-    }
-
-    pub fn data_local_dir() -> Option<std::path::PathBuf> {
-        super::dirs_data_local_dir()
-    }
 }

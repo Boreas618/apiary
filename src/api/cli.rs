@@ -9,6 +9,26 @@ use futures::stream::{self, StreamExt};
 
 use crate::api::server;
 
+/// Resolve config path, load from file, and optionally enable seccomp.
+fn load_config(
+    config_path: Option<PathBuf>,
+    enable_seccomp: bool,
+) -> anyhow::Result<(PoolConfig, PathBuf)> {
+    let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
+    if !config_file.exists() {
+        anyhow::bail!(
+            "Config file not found: {}. Run 'apiary init' first.",
+            config_file.display()
+        );
+    }
+    let mut config = PoolConfig::from_file(&config_file)?;
+    if enable_seccomp {
+        config = config.with_seccomp_enabled(true);
+    }
+    tracing::info!("Loaded config from: {}", config_file.display());
+    Ok((config, config_file))
+}
+
 /// Initialize the sandbox pool.
 pub async fn init_pool(
     base_image: PathBuf,
@@ -85,22 +105,7 @@ pub async fn run_daemon(
     config_path: Option<PathBuf>,
     enable_seccomp: bool,
 ) -> anyhow::Result<()> {
-    let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
-
-    if !config_file.exists() {
-        anyhow::bail!(
-            "Config file not found: {}. Run 'apiary init' first.",
-            config_file.display()
-        );
-    }
-
-    let config = PoolConfig::from_file(&config_file)?;
-    let config = if enable_seccomp {
-        config.with_seccomp_enabled(true)
-    } else {
-        config
-    };
-    tracing::info!("Loaded config from: {}", config_file.display());
+    let (config, _) = load_config(config_path, enable_seccomp)?;
 
     let pool = Pool::new(config).await?;
     tracing::info!("Pool initialized with {} sandboxes", pool.status().total);
@@ -123,21 +128,7 @@ pub async fn run_task(
     config_path: Option<PathBuf>,
     enable_seccomp: bool,
 ) -> anyhow::Result<()> {
-    let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
-
-    if !config_file.exists() {
-        anyhow::bail!(
-            "Config file not found: {}. Run 'apiary init' first.",
-            config_file.display()
-        );
-    }
-
-    let config = PoolConfig::from_file(&config_file)?;
-    let config = if enable_seccomp {
-        config.with_seccomp_enabled(true)
-    } else {
-        config
-    };
+    let (config, _) = load_config(config_path, enable_seccomp)?;
     let pool = Pool::new(config.clone()).await?;
 
     let env_map: HashMap<String, String> = env
@@ -230,25 +221,11 @@ pub async fn run_batch(
     config_path: Option<PathBuf>,
     enable_seccomp: bool,
 ) -> anyhow::Result<()> {
-    let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
-
-    if !config_file.exists() {
-        anyhow::bail!(
-            "Config file not found: {}. Run 'apiary init' first.",
-            config_file.display()
-        );
-    }
-
     if !tasks_file.exists() {
         anyhow::bail!("Tasks file not found: {}", tasks_file.display());
     }
 
-    let config = PoolConfig::from_file(&config_file)?;
-    let config = if enable_seccomp {
-        config.with_seccomp_enabled(true)
-    } else {
-        config
-    };
+    let (config, _) = load_config(config_path, enable_seccomp)?;
     let capped_min = parallelism.min(config.min_sandboxes);
     let capped_max = parallelism.min(config.max_sandboxes);
     let config = config.with_pool_bounds(capped_min, capped_max)?;
@@ -340,16 +317,7 @@ pub async fn run_batch(
 
 /// Show pool configuration (reads config without creating a pool).
 pub async fn show_status(config_path: Option<PathBuf>) -> anyhow::Result<()> {
-    let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
-
-    if !config_file.exists() {
-        anyhow::bail!(
-            "Config file not found: {}. Run 'apiary init' first.",
-            config_file.display()
-        );
-    }
-
-    let config = PoolConfig::from_file(&config_file)?;
+    let (config, config_file) = load_config(config_path, false)?;
 
     println!("=== Sandbox Pool Configuration ===");
     println!("Config file: {}", config_file.display());

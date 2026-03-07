@@ -11,23 +11,6 @@
 use apiary::{PoolConfig, Task, TaskResult};
 use std::time::Duration;
 
-/// Check if we can run namespace tests.
-#[allow(dead_code)]
-fn can_run_namespace_tests() -> bool {
-    let status = std::process::Command::new("unshare")
-        .args(["--user", "true"])
-        .status();
-
-    status.is_ok() && status.unwrap().success()
-}
-
-/// Check if we're running in a sandbox (e.g., CI container).
-#[allow(dead_code)]
-fn is_in_sandbox() -> bool {
-    std::env::var("CODEX_SANDBOX").is_ok()
-        || std::env::var("CODEX_SANDBOX_NETWORK_DISABLED").is_ok()
-}
-
 #[test]
 fn test_task_creation() {
     let task = Task::new("echo hello");
