@@ -27,10 +27,6 @@ struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Enable seccomp syscall filtering inside sandboxes
-    #[arg(long, global = true)]
-    seccomp: bool,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -145,7 +141,6 @@ async fn async_main() -> anyhow::Result<()> {
     setup_logging(cli.verbose);
 
     let config_path = cli.config;
-    let seccomp = cli.seccomp;
 
     match cli.command {
         Commands::Init {
@@ -166,12 +161,11 @@ async fn async_main() -> anyhow::Result<()> {
                 Duration::from_secs(cooldown_secs),
                 overlay_dir,
                 config_path,
-                seccomp,
             )
             .await?;
         }
         Commands::Daemon { bind, api_token } => {
-            run_daemon(bind, api_token, config_path, seccomp).await?;
+            run_daemon(bind, api_token, config_path).await?;
         }
         Commands::Run {
             command,
@@ -179,10 +173,10 @@ async fn async_main() -> anyhow::Result<()> {
             workdir,
             env,
         } => {
-            run_task(command, timeout, workdir, env, config_path, seccomp).await?;
+            run_task(command, timeout, workdir, env, config_path).await?;
         }
         Commands::Batch { tasks, parallelism } => {
-            run_batch(tasks, parallelism, config_path, seccomp).await?;
+            run_batch(tasks, parallelism, config_path).await?;
         }
         Commands::Status => {
             show_status(config_path).await?;
@@ -199,11 +193,8 @@ fn resolve_config_path(config_path: Option<PathBuf>) -> PathBuf {
     config_path.unwrap_or_else(PoolConfig::default_config_path)
 }
 
-/// Resolve config path, load from file, and optionally enable seccomp.
-fn load_config(
-    config_path: Option<PathBuf>,
-    enable_seccomp: bool,
-) -> anyhow::Result<(PoolConfig, PathBuf)> {
+/// Resolve config path and load from file.
+fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<(PoolConfig, PathBuf)> {
     let config_file = resolve_config_path(config_path);
     if !config_file.exists() {
         anyhow::bail!(
@@ -212,11 +203,7 @@ fn load_config(
         );
     }
 
-    let mut config = PoolConfig::from_file(&config_file)?;
-    if enable_seccomp {
-        config = config.with_seccomp_enabled(true);
-    }
-
+    let config = PoolConfig::from_file(&config_file)?;
     tracing::info!("Loaded config from: {}", config_file.display());
     Ok((config, config_file))
 }
@@ -231,7 +218,6 @@ pub async fn init_pool(
     cooldown: Duration,
     overlay_dir: Option<PathBuf>,
     config_path: Option<PathBuf>,
-    enable_seccomp: bool,
 ) -> anyhow::Result<()> {
     tracing::info!("Initializing sandbox pool...");
 
@@ -248,7 +234,6 @@ pub async fn init_pool(
         .cooldown(cooldown)
         .base_image(&base_image)
         .overlay_dir(&overlay_dir)
-        .enable_seccomp(enable_seccomp)
         .build()?;
 
     let config_file = resolve_config_path(config_path);
@@ -274,14 +259,7 @@ pub async fn init_pool(
     println!("  Scale-up step: {scale_up_step}");
     println!("  Idle timeout: {idle_timeout:?}");
     println!("  Cooldown: {cooldown:?}");
-    println!(
-        "  Seccomp: {}",
-        if enable_seccomp {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
+    println!("  Seccomp: enabled");
     println!("  Config file: {}", config_file.display());
     println!("  Overlay dir: {}", overlay_dir.display());
 
@@ -294,9 +272,8 @@ pub async fn run_daemon(
     bind: String,
     api_token: Option<String>,
     config_path: Option<PathBuf>,
-    enable_seccomp: bool,
 ) -> anyhow::Result<()> {
-    let (config, _) = load_config(config_path, enable_seccomp)?;
+    let (config, _) = load_config(config_path)?;
 
     let pool = Pool::new(config).await?;
     tracing::info!("Pool initialized with {} sandboxes", pool.status().total);
@@ -317,9 +294,8 @@ pub async fn run_task(
     workdir: Option<PathBuf>,
     env: Vec<String>,
     config_path: Option<PathBuf>,
-    enable_seccomp: bool,
 ) -> anyhow::Result<()> {
-    let (config, _) = load_config(config_path, enable_seccomp)?;
+    let (config, _) = load_config(config_path)?;
     let pool = Pool::new(config).await?;
 
     let env_map: HashMap<String, String> = env
@@ -382,7 +358,6 @@ pub async fn run_batch(
     tasks_file: PathBuf,
     parallelism: usize,
     config_path: Option<PathBuf>,
-    enable_seccomp: bool,
 ) -> anyhow::Result<()> {
     if parallelism == 0 {
         anyhow::bail!("parallelism must be at least 1");
@@ -391,7 +366,7 @@ pub async fn run_batch(
         anyhow::bail!("Tasks file not found: {}", tasks_file.display());
     }
 
-    let (config, _) = load_config(config_path, enable_seccomp)?;
+    let (config, _) = load_config(config_path)?;
     let capped_min = parallelism.min(config.min_sandboxes);
     let capped_max = parallelism.min(config.max_sandboxes);
     let config = config.with_pool_bounds(capped_min, capped_max)?;
@@ -494,7 +469,7 @@ async fn run_batch_tasks(
 
 /// Show pool configuration (reads config without creating a pool).
 pub async fn show_status(config_path: Option<PathBuf>) -> anyhow::Result<()> {
-    let (config, config_file) = load_config(config_path, false)?;
+    let (config, config_file) = load_config(config_path)?;
 
     println!("=== Sandbox Pool Configuration ===");
     println!("Config file: {}", config_file.display());
@@ -508,14 +483,7 @@ pub async fn show_status(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     println!("Overlay driver: {:?}", config.overlay_driver);
     println!("Default timeout: {:?}", config.default_timeout);
     println!("Default workdir: {}", config.default_workdir.display());
-    println!(
-        "Seccomp: {}",
-        if config.enable_seccomp {
-            "enabled"
-        } else {
-            "disabled (use --seccomp to enable)"
-        }
-    );
+    println!("Seccomp: enabled");
     println!();
     println!("=== Resource Limits ===");
     println!("Memory max: {}", config.resource_limits.memory_max);
@@ -525,26 +493,24 @@ pub async fn show_status(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         println!("I/O max: {io_max}");
     }
 
-    if config.enable_seccomp {
-        println!();
-        println!("=== Seccomp Policy ===");
-        println!("Block network: {}", config.seccomp_policy.block_network);
+    println!();
+    println!("=== Seccomp Policy ===");
+    println!("Block network: {}", config.seccomp_policy.block_network);
+    println!(
+        "Allow UNIX sockets: {}",
+        config.seccomp_policy.allow_unix_sockets
+    );
+    if !config.seccomp_policy.blocked_syscalls.is_empty() {
         println!(
-            "Allow UNIX sockets: {}",
-            config.seccomp_policy.allow_unix_sockets
+            "Additional blocked: {}",
+            config.seccomp_policy.blocked_syscalls.join(", ")
         );
-        if !config.seccomp_policy.blocked_syscalls.is_empty() {
-            println!(
-                "Additional blocked: {}",
-                config.seccomp_policy.blocked_syscalls.join(", ")
-            );
-        }
-        if !config.seccomp_policy.allowed_syscalls.is_empty() {
-            println!(
-                "Explicitly allowed: {}",
-                config.seccomp_policy.allowed_syscalls.join(", ")
-            );
-        }
+    }
+    if !config.seccomp_policy.allowed_syscalls.is_empty() {
+        println!(
+            "Explicitly allowed: {}",
+            config.seccomp_policy.allowed_syscalls.join(", ")
+        );
     }
 
     println!();

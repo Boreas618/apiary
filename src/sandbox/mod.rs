@@ -87,7 +87,6 @@ pub struct Sandbox {
     work_path: PathBuf,
     init_pid: Mutex<Option<nix::unistd::Pid>>,
     resource_limits: ResourceLimits,
-    enable_seccomp: bool,
     seccomp_policy: SeccompPolicy,
     cgroup_path: Option<PathBuf>,
     active_overlay: Mutex<Option<ActiveOverlay>>,
@@ -124,7 +123,6 @@ impl Sandbox {
             work_path,
             init_pid: Mutex::new(None),
             resource_limits: config.resource_limits.clone(),
-            enable_seccomp: config.enable_seccomp,
             seccomp_policy: config.seccomp_policy.clone(),
             cgroup_path: None,
             active_overlay: Mutex::new(None),
@@ -249,7 +247,6 @@ impl Sandbox {
             .clone()
             .unwrap_or_else(|| PathBuf::from("/workspace"));
         let cgroup_path = self.cgroup_path.clone();
-        let enable_seccomp = self.enable_seccomp;
         let seccomp_policy = self.seccomp_policy.clone();
         let task_uid = task.uid;
         let task_gid = task.gid;
@@ -288,7 +285,6 @@ impl Sandbox {
                     &root,
                     &workdir,
                     cgroup_path.as_deref(),
-                    enable_seccomp,
                     &seccomp_policy,
                     task_uid,
                     task_gid,

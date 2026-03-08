@@ -10,7 +10,6 @@ pub(super) fn configure_task_process_linux(
     root: &Path,
     workdir: &Path,
     cgroup_path: Option<&Path>,
-    enable_seccomp: bool,
     seccomp_policy: &SeccompPolicy,
     uid: Option<u32>,
     gid: Option<u32>,
@@ -83,14 +82,14 @@ pub(super) fn configure_task_process_linux(
         }
     }
 
-    if enable_seccomp {
-        if seccomp::set_no_new_privs().is_err() {
-            write_stderr_safe(
-                b"[apiary] warning: failed to set no_new_privs; continuing without seccomp\n",
-            );
-        } else if seccomp::apply_seccomp_filter(seccomp_policy).is_err() {
-            write_stderr_safe(b"[apiary] warning: failed to apply seccomp filter; continuing\n");
-        }
+    if seccomp::set_no_new_privs().is_err() {
+        write_stderr_safe(
+            b"[apiary] warning: failed to set no_new_privs; continuing without seccomp\n",
+        );
+    } else if seccomp::apply_seccomp_filter(seccomp_policy).is_err() {
+        write_stderr_safe(
+            b"[apiary] warning: failed to apply seccomp filter; continuing without seccomp\n",
+        );
     }
 
     Ok(())

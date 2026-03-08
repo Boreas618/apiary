@@ -262,7 +262,6 @@ base_image = "./rootfs"
 overlay_dir = "~/.local/share/apiary/overlays"
 default_timeout = "300s"
 default_workdir = "/workspace"
-enable_seccomp = false
 
 [resource_limits]
 memory_max = "2G"
@@ -332,13 +331,13 @@ The sandbox provides multiple layers of isolation:
 2. **Mount Namespace**: Isolated filesystem view with OverlayFS
 3. **IPC Namespace**: Isolated System V IPC and POSIX message queues
 4. **UTS Namespace**: Isolated hostname
-5. **seccomp**: Blocks network syscalls and other dangerous operations (when enabled)
+5. **seccomp**: Blocks network syscalls and other dangerous operations
 6. **cgroups**: Limits CPU, memory, and other resources
 
 ### Protected Paths
 
 - `/proc`, `/sys`: Mounted with appropriate restrictions
-- Network: Blocked by default via seccomp syscall filtering (note: this is not network namespace isolation; enable seccomp with `--seccomp`)
+- Network: Blocked by seccomp syscall filtering (note: this is not network namespace isolation; if seccomp cannot be applied, Apiary emits a warning and continues)
 
 ## License
 

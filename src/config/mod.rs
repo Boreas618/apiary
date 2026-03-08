@@ -69,7 +69,6 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::Mutex;
-
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {

@@ -9,6 +9,7 @@ use super::overlay::OverlayDriver;
 
 /// Main configuration for the sandbox pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoolConfig {
     /// Minimum number of sandboxes (created at startup, never scaled below).
     #[serde(default = "default_min_sandboxes")]
@@ -44,11 +45,7 @@ pub struct PoolConfig {
     #[serde(default)]
     pub resource_limits: ResourceLimits,
 
-    /// Whether seccomp filtering is enabled. Off by default; enable with --seccomp.
-    #[serde(default)]
-    pub enable_seccomp: bool,
-
-    /// seccomp policy configuration (only applies when enable_seccomp is true).
+    /// seccomp policy configuration.
     #[serde(default)]
     pub seccomp_policy: SeccompPolicy,
 
@@ -105,7 +102,6 @@ impl Default for PoolConfig {
             overlay_dir: PathBuf::from("./overlays"),
             overlay_driver: OverlayDriver::default(),
             resource_limits: ResourceLimits::default(),
-            enable_seccomp: false,
             seccomp_policy: SeccompPolicy::default(),
             default_timeout: default_timeout(),
             default_workdir: default_workdir(),
@@ -116,6 +112,7 @@ impl Default for PoolConfig {
 
 /// Resource limits for cgroups v2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceLimits {
     /// Maximum memory in bytes (e.g., "2G", "512M").
     #[serde(default = "default_memory_max")]
@@ -159,6 +156,7 @@ impl Default for ResourceLimits {
 
 /// seccomp policy configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SeccompPolicy {
     /// Whether to block network syscalls.
     #[serde(default = "default_block_network")]
@@ -215,12 +213,6 @@ impl PoolConfig {
         Ok(())
     }
 
-    /// Return a new config with seccomp enabled/disabled.
-    pub fn with_seccomp_enabled(mut self, enabled: bool) -> Self {
-        self.enable_seccomp = enabled;
-        self
-    }
-
     /// Return a new config with adjusted pool bounds (validates invariants).
     pub fn with_pool_bounds(mut self, min: usize, max: usize) -> anyhow::Result<Self> {
         self.min_sandboxes = min;
@@ -242,7 +234,6 @@ pub struct PoolConfigBuilder {
     overlay_dir: Option<PathBuf>,
     overlay_driver: Option<OverlayDriver>,
     resource_limits: Option<ResourceLimits>,
-    enable_seccomp: Option<bool>,
     seccomp_policy: Option<SeccompPolicy>,
     default_timeout: Option<Duration>,
     default_workdir: Option<PathBuf>,
@@ -295,11 +286,6 @@ impl PoolConfigBuilder {
         self
     }
 
-    pub fn enable_seccomp(mut self, enabled: bool) -> Self {
-        self.enable_seccomp = Some(enabled);
-        self
-    }
-
     pub fn seccomp_policy(mut self, policy: SeccompPolicy) -> Self {
         self.seccomp_policy = Some(policy);
         self
@@ -337,7 +323,6 @@ impl PoolConfigBuilder {
                 .unwrap_or_else(super::PoolConfig::default_overlay_dir),
             overlay_driver: self.overlay_driver.unwrap_or_default(),
             resource_limits: self.resource_limits.unwrap_or_default(),
-            enable_seccomp: self.enable_seccomp.unwrap_or(false),
             seccomp_policy: self.seccomp_policy.unwrap_or_default(),
             default_timeout: self.default_timeout.unwrap_or_else(default_timeout),
             default_workdir: self.default_workdir.unwrap_or_else(default_workdir),
@@ -345,6 +330,25 @@ impl PoolConfigBuilder {
         };
         config.validate()?;
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PoolConfig;
+
+    #[test]
+    fn unknown_top_level_field_is_rejected() {
+        let error = toml::from_str::<PoolConfig>(
+            r#"
+base_image = "/tmp/rootfs"
+overlay_dir = "/tmp/overlays"
+unexpected_field = true
+"#,
+        )
+        .expect_err("unknown config fields must be rejected");
+
+        assert!(error.to_string().contains("unknown field"));
     }
 }
 
