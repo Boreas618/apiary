@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::sandbox::overlay::OverlayDriver;
+use super::overlay::OverlayDriver;
 
 /// Main configuration for the sandbox pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]

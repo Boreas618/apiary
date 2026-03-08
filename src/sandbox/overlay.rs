@@ -23,23 +23,10 @@
 use std::path::Path;
 
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use serde::{Deserialize, Serialize};
 
 use super::SandboxError;
+use crate::config::OverlayDriver;
 use crate::sandbox::namespace;
-
-/// Which overlay implementation to use.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum OverlayDriver {
-    /// Try kernel overlayfs first, fall back to fuse-overlayfs.
-    #[default]
-    Auto,
-    /// Force kernel overlayfs (may require privileges or kernel >= 5.11).
-    KernelOverlay,
-    /// Force fuse-overlayfs (requires the binary to be installed).
-    FuseOverlayfs,
-}
 
 /// Tracks which overlay implementation is actively in use for a mount.
 /// Needed to select the correct unmount strategy.
@@ -72,20 +59,19 @@ pub fn setup_overlay(
     let rootless = namespace::is_rootless_mode();
 
     match driver {
-        OverlayDriver::Auto => {
-            match try_kernel_overlay(merged, upper, work, lower, rootless) {
-                Ok(()) => {
-                    tracing::info!("Using kernel overlayfs");
-                    Ok(ActiveOverlay::KernelOverlay)
-                }
-                Err(kernel_err) => {
-                    tracing::debug!(
-                        %kernel_err,
-                        "Kernel overlay mount failed; trying fuse-overlayfs"
-                    );
-                    try_fuse_overlayfs(merged, upper, work, lower).map_err(|fuse_err| {
-                        SandboxError::OverlaySetup(format!(
-                            "All overlay drivers failed.\n\
+        OverlayDriver::Auto => match try_kernel_overlay(merged, upper, work, lower, rootless) {
+            Ok(()) => {
+                tracing::info!("Using kernel overlayfs");
+                Ok(ActiveOverlay::KernelOverlay)
+            }
+            Err(kernel_err) => {
+                tracing::debug!(
+                    %kernel_err,
+                    "Kernel overlay mount failed; trying fuse-overlayfs"
+                );
+                try_fuse_overlayfs(merged, upper, work, lower).map_err(|fuse_err| {
+                    SandboxError::OverlaySetup(format!(
+                        "All overlay drivers failed.\n\
                              Kernel overlay: {kernel_err}\n\
                              fuse-overlayfs: {fuse_err}\n\n\
                              Possible fixes:\n\
@@ -94,13 +80,12 @@ pub fn setup_overlay(
                              - Use a kernel >= 5.11 with unprivileged overlay support\n\
                              - Check AppArmor/SELinux policies that may block overlay mounts\n\
                              - Run as root (not recommended)"
-                        ))
-                    })?;
-                    tracing::info!("Using fuse-overlayfs (kernel overlay unavailable)");
-                    Ok(ActiveOverlay::FuseOverlayfs)
-                }
+                    ))
+                })?;
+                tracing::info!("Using fuse-overlayfs (kernel overlay unavailable)");
+                Ok(ActiveOverlay::FuseOverlayfs)
             }
-        }
+        },
         OverlayDriver::KernelOverlay => {
             try_kernel_overlay(merged, upper, work, lower, rootless)?;
             tracing::info!("Using kernel overlayfs (forced)");
@@ -191,11 +176,9 @@ fn try_fuse_overlayfs(
 /// Unmount an overlay filesystem.
 pub fn unmount_overlay(merged: &Path, active: &ActiveOverlay) -> Result<(), SandboxError> {
     match active {
-        ActiveOverlay::KernelOverlay => {
-            umount2(merged, MntFlags::MNT_DETACH).map_err(|e| {
-                SandboxError::OverlaySetup(format!("failed to unmount kernel overlay: {e}"))
-            })
-        }
+        ActiveOverlay::KernelOverlay => umount2(merged, MntFlags::MNT_DETACH).map_err(|e| {
+            SandboxError::OverlaySetup(format!("failed to unmount kernel overlay: {e}"))
+        }),
         ActiveOverlay::FuseOverlayfs => unmount_fuse_overlay(merged),
     }
 }
@@ -380,9 +363,7 @@ fn bind_or_create_device_nodes(dev_path: &Path) {
         )
         .is_err()
         {
-            tracing::warn!(
-                "/dev/{name} unavailable (bind-mount and mknod both failed)"
-            );
+            tracing::warn!("/dev/{name} unavailable (bind-mount and mknod both failed)");
         }
     }
 }
@@ -434,10 +415,7 @@ pub fn clear_upper_layer(upper: &Path) -> Result<(), SandboxError> {
             })?;
         } else {
             std::fs::remove_file(&path).map_err(|e| {
-                SandboxError::OverlaySetup(format!(
-                    "failed to remove file {}: {e}",
-                    path.display()
-                ))
+                SandboxError::OverlaySetup(format!("failed to remove file {}: {e}", path.display()))
             })?;
         }
     }
@@ -464,23 +442,5 @@ mod tests {
 
         assert!(upper.exists());
         assert!(std::fs::read_dir(&upper).unwrap().next().is_none());
-    }
-
-    #[test]
-    fn test_overlay_driver_default() {
-        let driver = OverlayDriver::default();
-        assert_eq!(driver, OverlayDriver::Auto);
-    }
-
-    #[test]
-    fn test_overlay_driver_serde() {
-        let json = serde_json::to_string(&OverlayDriver::FuseOverlayfs).unwrap();
-        assert_eq!(json, "\"fuse_overlayfs\"");
-
-        let parsed: OverlayDriver = serde_json::from_str("\"auto\"").unwrap();
-        assert_eq!(parsed, OverlayDriver::Auto);
-
-        let parsed: OverlayDriver = serde_json::from_str("\"kernel_overlay\"").unwrap();
-        assert_eq!(parsed, OverlayDriver::KernelOverlay);
     }
 }

@@ -162,7 +162,7 @@ Example JSON task request (`session_id` is required, `working_dir` is an optiona
 ```json
 {
   "command": "bash -lc 'echo start && sleep 1 && echo done'",
-  "timeout_secs": 30,
+  "timeout_ms": 30000,
   "working_dir": "/workspace",
   "session_id": "required-session-id",
   "env": {
@@ -277,7 +277,7 @@ allow_unix_sockets = true
 ## Tasks JSON Format
 
 The batch tasks file uses the `Task` struct directly. Note that `timeout` is in
-**milliseconds** (unlike the HTTP API which accepts `timeout_secs` or `timeout_ms`).
+**milliseconds** (the HTTP API also accepts `timeout_ms`).
 
 ```json
 [

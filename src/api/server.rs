@@ -21,12 +21,11 @@ struct AppState {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExecuteTaskRequest {
     command: String,
     #[serde(default)]
     timeout_ms: Option<u64>,
-    #[serde(default)]
-    timeout_secs: Option<u64>,
     #[serde(default)]
     working_dir: Option<PathBuf>,
     #[serde(default)]
@@ -35,6 +34,7 @@ struct ExecuteTaskRequest {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateSessionRequest {
     #[serde(default)]
     working_dir: Option<PathBuf>,
@@ -217,13 +217,10 @@ fn build_task(payload: ExecuteTaskRequest, config: &PoolConfig) -> Result<Task, 
         return Err(ApiError::bad_request("command must not be empty"));
     }
 
-    let timeout = if let Some(ms) = payload.timeout_ms {
-        Duration::from_millis(ms)
-    } else if let Some(secs) = payload.timeout_secs {
-        Duration::from_secs(secs)
-    } else {
-        config.default_timeout
-    };
+    let timeout = payload
+        .timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(config.default_timeout);
 
     let mut env = config.default_env.clone();
     env.extend(payload.env);
@@ -291,6 +288,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn test_config() -> PoolConfig {
         PoolConfig::builder()
@@ -308,7 +306,6 @@ mod tests {
             ExecuteTaskRequest {
                 command: "echo hello".to_string(),
                 timeout_ms: None,
-                timeout_secs: None,
                 working_dir: None,
                 env: HashMap::new(),
                 session_id: "session-1".to_string(),
@@ -331,7 +328,6 @@ mod tests {
             ExecuteTaskRequest {
                 command: "echo hello".to_string(),
                 timeout_ms: None,
-                timeout_secs: None,
                 working_dir: Some(PathBuf::from("src")),
                 env: HashMap::new(),
                 session_id: "session-1".to_string(),
@@ -341,5 +337,58 @@ mod tests {
         .expect("task should build");
 
         assert_eq!(task.working_dir, Some(PathBuf::from("src")));
+    }
+
+    #[test]
+    fn build_task_rejects_blank_commands() {
+        let error = build_task(
+            ExecuteTaskRequest {
+                command: "   ".to_string(),
+                timeout_ms: None,
+                working_dir: None,
+                env: HashMap::new(),
+                session_id: "session-1".to_string(),
+            },
+            &test_config(),
+        )
+        .expect_err("blank commands should be rejected");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message, "command must not be empty");
+    }
+
+    #[test]
+    fn build_task_uses_timeout_ms_and_overrides_default_env() {
+        let mut env = HashMap::new();
+        env.insert("DEFAULT_KEY".to_string(), "override".to_string());
+        env.insert("EXTRA_KEY".to_string(), "extra-value".to_string());
+
+        let task = build_task(
+            ExecuteTaskRequest {
+                command: "echo hello".to_string(),
+                timeout_ms: Some(1_500),
+                working_dir: None,
+                env,
+                session_id: "session-1".to_string(),
+            },
+            &test_config(),
+        )
+        .expect("task should build");
+
+        assert_eq!(task.timeout, Duration::from_millis(1_500));
+        assert_eq!(task.env.get("DEFAULT_KEY"), Some(&"override".to_string()));
+        assert_eq!(task.env.get("EXTRA_KEY"), Some(&"extra-value".to_string()));
+    }
+
+    #[test]
+    fn execute_task_request_rejects_removed_timeout_secs_field() {
+        let error = serde_json::from_value::<ExecuteTaskRequest>(json!({
+            "command": "echo hello",
+            "timeout_secs": 30,
+            "session_id": "session-1"
+        }))
+        .expect_err("unknown timeout field should be rejected");
+
+        assert!(error.to_string().contains("unknown field `timeout_secs`"));
     }
 }

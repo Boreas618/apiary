@@ -5,26 +5,218 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use apiary::{Pool, PoolConfig, PoolError, SessionOptions, Task};
-use futures::stream::{self, StreamExt};
+use clap::{Parser, Subcommand};
+use tokio::task::JoinSet;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::api::server;
+
+#[derive(Parser)]
+#[command(name = "apiary")]
+#[command(
+    author,
+    version,
+    about = "A lightweight sandbox pool for running tasks with isolation"
+)]
+struct Cli {
+    /// Config file path
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Verbose output
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Enable seccomp syscall filtering inside sandboxes
+    #[arg(long, global = true)]
+    seccomp: bool,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Initialize the sandbox pool
+    Init {
+        /// Path to base rootfs image
+        #[arg(long)]
+        base_image: PathBuf,
+
+        /// Minimum number of sandboxes (created at startup)
+        #[arg(long, default_value = "10")]
+        min_sandboxes: usize,
+
+        /// Maximum number of sandboxes (hard ceiling for auto-scaling)
+        #[arg(long, default_value = "40")]
+        max_sandboxes: usize,
+
+        /// Number of sandboxes to create per scale-up event
+        #[arg(long, default_value = "2")]
+        scale_up_step: usize,
+
+        /// How long (seconds) an excess sandbox can be idle before removal
+        #[arg(long, default_value = "300")]
+        idle_timeout_secs: u64,
+
+        /// Minimum seconds between scaling events
+        #[arg(long, default_value = "30")]
+        cooldown_secs: u64,
+
+        /// Directory to store overlay layers
+        #[arg(long)]
+        overlay_dir: Option<PathBuf>,
+    },
+
+    /// Start the sandbox pool daemon
+    Daemon {
+        /// Bind address for the API server
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: String,
+
+        /// Bearer token for API authentication (also reads APIARY_API_TOKEN env)
+        #[arg(long, env = "APIARY_API_TOKEN")]
+        api_token: Option<String>,
+    },
+
+    /// Run a single command in a sandbox
+    Run {
+        /// Command to execute
+        #[arg(long)]
+        command: String,
+
+        /// Timeout in seconds
+        #[arg(long, default_value = "60")]
+        timeout: u64,
+
+        /// Default session working directory inside the sandbox
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+
+        /// Environment variables (KEY=VALUE)
+        #[arg(long, short = 'e')]
+        env: Vec<String>,
+    },
+
+    /// Run multiple tasks from a JSON file
+    Batch {
+        /// Path to tasks JSON file
+        #[arg(long)]
+        tasks: PathBuf,
+
+        /// Maximum parallel tasks
+        #[arg(long, default_value = "10", value_parser = clap::value_parser!(usize).range(1..))]
+        parallelism: usize,
+    },
+
+    /// Show pool configuration and status
+    Status,
+
+    /// Clean up sandbox pool resources
+    Clean {
+        /// Force cleanup even if sandboxes are running
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+pub fn main() -> anyhow::Result<()> {
+    tokio::runtime::Runtime::new()?.block_on(async_main())
+}
+
+fn setup_logging(verbose: u8) {
+    let default_filter = match verbose {
+        0 => "apiary=info",
+        1 => "apiary=debug",
+        _ => "apiary=trace",
+    };
+
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::builder().parse_lossy(default_filter));
+
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(env_filter)
+        .init();
+}
+
+async fn async_main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    setup_logging(cli.verbose);
+
+    let config_path = cli.config;
+    let seccomp = cli.seccomp;
+
+    match cli.command {
+        Commands::Init {
+            base_image,
+            min_sandboxes,
+            max_sandboxes,
+            scale_up_step,
+            idle_timeout_secs,
+            cooldown_secs,
+            overlay_dir,
+        } => {
+            init_pool(
+                base_image,
+                min_sandboxes,
+                max_sandboxes,
+                scale_up_step,
+                Duration::from_secs(idle_timeout_secs),
+                Duration::from_secs(cooldown_secs),
+                overlay_dir,
+                config_path,
+                seccomp,
+            )
+            .await?;
+        }
+        Commands::Daemon { bind, api_token } => {
+            run_daemon(bind, api_token, config_path, seccomp).await?;
+        }
+        Commands::Run {
+            command,
+            timeout,
+            workdir,
+            env,
+        } => {
+            run_task(command, timeout, workdir, env, config_path, seccomp).await?;
+        }
+        Commands::Batch { tasks, parallelism } => {
+            run_batch(tasks, parallelism, config_path, seccomp).await?;
+        }
+        Commands::Status => {
+            show_status(config_path).await?;
+        }
+        Commands::Clean { force } => {
+            cleanup(force, config_path).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_config_path(config_path: Option<PathBuf>) -> PathBuf {
+    config_path.unwrap_or_else(PoolConfig::default_config_path)
+}
 
 /// Resolve config path, load from file, and optionally enable seccomp.
 fn load_config(
     config_path: Option<PathBuf>,
     enable_seccomp: bool,
 ) -> anyhow::Result<(PoolConfig, PathBuf)> {
-    let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
+    let config_file = resolve_config_path(config_path);
     if !config_file.exists() {
         anyhow::bail!(
             "Config file not found: {}. Run 'apiary init' first.",
             config_file.display()
         );
     }
+
     let mut config = PoolConfig::from_file(&config_file)?;
     if enable_seccomp {
         config = config.with_seccomp_enabled(true);
     }
+
     tracing::info!("Loaded config from: {}", config_file.display());
     Ok((config, config_file))
 }
@@ -48,7 +240,6 @@ pub async fn init_pool(
     }
 
     let overlay_dir = overlay_dir.unwrap_or_else(PoolConfig::default_overlay_dir);
-
     let config = PoolConfig::builder()
         .min_sandboxes(min_sandboxes)
         .max_sandboxes(max_sandboxes)
@@ -60,7 +251,7 @@ pub async fn init_pool(
         .enable_seccomp(enable_seccomp)
         .build()?;
 
-    let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
+    let config_file = resolve_config_path(config_path);
     if let Some(parent) = config_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -133,8 +324,8 @@ pub async fn run_task(
 
     let env_map: HashMap<String, String> = env
         .iter()
-        .filter_map(|s| {
-            let (key, value) = s.split_once('=')?;
+        .filter_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
             Some((key.to_string(), value.to_string()))
         })
         .collect();
@@ -193,6 +384,9 @@ pub async fn run_batch(
     config_path: Option<PathBuf>,
     enable_seccomp: bool,
 ) -> anyhow::Result<()> {
+    if parallelism == 0 {
+        anyhow::bail!("parallelism must be at least 1");
+    }
     if !tasks_file.exists() {
         anyhow::bail!("Tasks file not found: {}", tasks_file.display());
     }
@@ -211,37 +405,30 @@ pub async fn run_batch(
     tracing::info!("Running with parallelism: {parallelism} (session-only mode)");
 
     let start = std::time::Instant::now();
-    let results: Vec<Result<apiary::TaskResult, PoolError>> =
-        stream::iter(tasks.into_iter().map(|task| {
-            let pool = pool.clone();
-            async move { pool.run_task(task, SessionOptions::default()).await }
-        }))
-        .buffer_unordered(parallelism)
-        .collect()
-        .await;
+    let results = run_batch_tasks(pool.clone(), tasks, parallelism).await?;
     let duration = start.elapsed();
 
     let mut succeeded = 0;
     let mut failed = 0;
     let mut timed_out = 0;
 
-    for (i, result) in results.iter().enumerate() {
+    for (idx, result) in results.iter().enumerate() {
         match result {
-            Ok(r) => {
-                if r.timed_out {
+            Ok(task_result) => {
+                if task_result.timed_out {
                     timed_out += 1;
-                    println!("Task {}: TIMEOUT", i + 1);
-                } else if r.exit_code == 0 {
+                    println!("Task {}: TIMEOUT", idx + 1);
+                } else if task_result.exit_code == 0 {
                     succeeded += 1;
-                    println!("Task {}: SUCCESS", i + 1);
+                    println!("Task {}: SUCCESS", idx + 1);
                 } else {
                     failed += 1;
-                    println!("Task {}: FAILED (exit {})", i + 1, r.exit_code);
+                    println!("Task {}: FAILED (exit {})", idx + 1, task_result.exit_code);
                 }
             }
-            Err(e) => {
+            Err(error) => {
                 failed += 1;
-                println!("Task {}: ERROR ({})", i + 1, e);
+                println!("Task {}: ERROR ({})", idx + 1, error);
             }
         }
     }
@@ -265,6 +452,44 @@ pub async fn run_batch(
     }
 
     Ok(())
+}
+
+async fn run_batch_tasks(
+    pool: Pool,
+    tasks: Vec<Task>,
+    parallelism: usize,
+) -> anyhow::Result<Vec<Result<apiary::TaskResult, PoolError>>> {
+    let mut pending = tasks.into_iter().enumerate();
+    let mut in_flight = JoinSet::new();
+    let mut results = Vec::new();
+
+    for _ in 0..parallelism {
+        let Some((index, task)) = pending.next() else {
+            break;
+        };
+        let pool = pool.clone();
+        in_flight
+            .spawn(async move { (index, pool.run_task(task, SessionOptions::default()).await) });
+    }
+
+    while let Some(joined) = in_flight.join_next().await {
+        let (index, result) =
+            joined.map_err(|error| anyhow::anyhow!("batch task join failed: {error}"))?;
+        results.push((index, result));
+
+        if let Some((next_index, next_task)) = pending.next() {
+            let pool = pool.clone();
+            in_flight.spawn(async move {
+                (
+                    next_index,
+                    pool.run_task(next_task, SessionOptions::default()).await,
+                )
+            });
+        }
+    }
+
+    results.sort_by_key(|(index, _)| *index);
+    Ok(results.into_iter().map(|(_, result)| result).collect())
 }
 
 /// Show pool configuration (reads config without creating a pool).
@@ -330,7 +555,7 @@ pub async fn show_status(config_path: Option<PathBuf>) -> anyhow::Result<()> {
 
 /// Clean up sandbox pool resources.
 pub async fn cleanup(force: bool, config_path: Option<PathBuf>) -> anyhow::Result<()> {
-    let config_file = config_path.unwrap_or_else(PoolConfig::default_config_path);
+    let config_file = resolve_config_path(config_path);
 
     if !config_file.exists() {
         println!("No pool configuration found. Nothing to clean.");

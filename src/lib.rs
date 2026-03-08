@@ -45,8 +45,7 @@ pub mod pool;
 pub mod sandbox;
 pub mod task;
 
-pub use config::{PoolConfig, PoolConfigBuilder, ResourceLimits, SeccompPolicy};
+pub use config::{OverlayDriver, PoolConfig, PoolConfigBuilder, ResourceLimits, SeccompPolicy};
 pub use pool::{Pool, PoolError, PoolStatus, SessionOptions};
-pub use sandbox::overlay::OverlayDriver;
 pub use sandbox::{Sandbox, SandboxError, SandboxState};
 pub use task::{MountSpec, Task, TaskBuilder, TaskResult};

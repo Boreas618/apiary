@@ -344,8 +344,7 @@ pub fn pivot_root(new_root: &Path, put_old: &Path) -> Result<(), SandboxError> {
     })?;
     nix_pivot_root(new_root, put_old)
         .map_err(|e| SandboxError::NamespaceCreation(format!("failed to pivot_root: {e}")))?;
-    chdir("/")
-        .map_err(|e| SandboxError::NamespaceCreation(format!("failed to chdir to /: {e}")))
+    chdir("/").map_err(|e| SandboxError::NamespaceCreation(format!("failed to chdir to /: {e}")))
 }
 
 #[cfg(test)]

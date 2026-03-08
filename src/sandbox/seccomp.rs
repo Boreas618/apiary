@@ -42,9 +42,24 @@ fn build_filter(policy: &SeccompPolicy) -> Result<SeccompFilter, SandboxError> {
     }
 
     let network_syscalls = [
-        "socket", "socketpair", "connect", "accept", "accept4", "bind", "listen", "sendto",
-        "sendmsg", "sendmmsg", "recvfrom", "recvmsg", "recvmmsg", "shutdown", "getsockname",
-        "getpeername", "getsockopt", "setsockopt",
+        "socket",
+        "socketpair",
+        "connect",
+        "accept",
+        "accept4",
+        "bind",
+        "listen",
+        "sendto",
+        "sendmsg",
+        "sendmmsg",
+        "recvfrom",
+        "recvmsg",
+        "recvmmsg",
+        "shutdown",
+        "getsockname",
+        "getpeername",
+        "getsockopt",
+        "setsockopt",
     ];
 
     for syscall_name in &policy.allowed_syscalls {

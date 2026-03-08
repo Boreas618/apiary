@@ -14,6 +14,7 @@
 
 use apiary::{Pool, PoolConfig, SessionOptions, Task};
 use std::time::Duration;
+use tokio::task::JoinSet;
 
 fn main() -> anyhow::Result<()> {
     apiary::sandbox::namespace::enter_rootless_mode()?;
@@ -71,11 +72,17 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Execute all tasks in parallel (each task gets its own ephemeral session).
     let start = std::time::Instant::now();
-    let results = futures::future::join_all(tasks.into_iter().map(|task| {
+    let mut results = Vec::new();
+    let mut in_flight = JoinSet::new();
+
+    for task in tasks {
         let pool = pool.clone();
-        async move { pool.run_task(task, SessionOptions::default()).await }
-    }))
-    .await;
+        in_flight.spawn(async move { pool.run_task(task, SessionOptions::default()).await });
+    }
+
+    while let Some(joined) = in_flight.join_next().await {
+        results.push(joined.expect("batch task should not panic"));
+    }
     let elapsed = start.elapsed();
 
     // Print results
@@ -112,7 +119,10 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // Print summary
-    let succeeded = results.iter().filter(|r| r.as_ref().is_ok_and(|r| r.success())).count();
+    let succeeded = results
+        .iter()
+        .filter(|r| r.as_ref().is_ok_and(|r| r.success()))
+        .count();
     let failed = results.len() - succeeded;
 
     println!("=== Summary ===");

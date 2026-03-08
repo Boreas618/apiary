@@ -80,7 +80,7 @@ fn default_max_output() -> usize {
 pub struct MountSpec {
     /// Source path on the host.
     pub source: PathBuf,
-    /// Destination path inside the sandbox.
+    /// Absolute destination path inside the sandbox.
     pub dest: PathBuf,
 }
 

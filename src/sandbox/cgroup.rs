@@ -34,7 +34,10 @@ pub fn setup_cgroup(sandbox_id: &str, limits: &ResourceLimits) -> Result<PathBuf
             .collect::<Vec<_>>()
             .join(" ");
         if !to_enable.is_empty() {
-            let _ = write_cgroup_file(parent, "cgroup.subtree_control", &to_enable);
+            log_best_effort(
+                "enable parent cgroup controllers",
+                write_cgroup_file(parent, "cgroup.subtree_control", &to_enable),
+            );
         }
     }
 
@@ -117,7 +120,10 @@ fn apply_limits(cgroup_path: &Path, limits: &ResourceLimits) -> Result<(), Sandb
     }
     if available.contains("io") {
         if let Some(ref io_max) = limits.io_max {
-            let _ = write_cgroup_file(cgroup_path, "io.max", io_max);
+            log_best_effort(
+                "apply io.max cgroup limit",
+                write_cgroup_file(cgroup_path, "io.max", io_max),
+            );
         }
     }
 
@@ -159,7 +165,10 @@ pub fn add_process_to_cgroup(cgroup_path: &Path, pid: u32) -> Result<(), Sandbox
 /// Reset cgroup statistics.
 pub fn reset_cgroup(cgroup_path: &Path) -> Result<(), SandboxError> {
     kill_cgroup_processes(cgroup_path)?;
-    let _ = write_cgroup_file(cgroup_path, "memory.reclaim", "0");
+    log_best_effort(
+        "reclaim memory for reset cgroup",
+        write_cgroup_file(cgroup_path, "memory.reclaim", "0"),
+    );
     Ok(())
 }
 
@@ -172,9 +181,12 @@ pub fn kill_cgroup_processes(cgroup_path: &Path) -> Result<(), SandboxError> {
     let procs = read_cgroup_file(cgroup_path, "cgroup.procs")?;
     for line in procs.lines() {
         if let Ok(pid) = line.parse::<i32>() {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
+            log_best_effort(
+                "kill remaining process in cgroup",
+                nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                ),
             );
         }
     }
@@ -183,7 +195,10 @@ pub fn kill_cgroup_processes(cgroup_path: &Path) -> Result<(), SandboxError> {
 
 /// Remove a cgroup. Retries briefly for processes to exit after SIGKILL.
 pub fn remove_cgroup(cgroup_path: &Path) -> Result<(), SandboxError> {
-    let _ = kill_cgroup_processes(cgroup_path);
+    log_best_effort(
+        "kill processes before removing cgroup",
+        kill_cgroup_processes(cgroup_path),
+    );
 
     for _ in 0..CGROUP_REMOVE_MAX_RETRIES {
         match fs::remove_dir(cgroup_path) {
@@ -221,18 +236,18 @@ pub fn get_cgroup_stats(cgroup_path: &Path) -> Result<CgroupStats, SandboxError>
     let mut stats = CgroupStats::default();
 
     if let Ok(s) = read_cgroup_file(cgroup_path, "memory.current") {
-        stats.memory_current = s.trim().parse().unwrap_or(0);
+        stats.memory_current = parse_cgroup_number("memory.current", s.trim());
     }
     if let Ok(s) = read_cgroup_file(cgroup_path, "memory.peak") {
-        stats.memory_peak = s.trim().parse().unwrap_or(0);
+        stats.memory_peak = parse_cgroup_number("memory.peak", s.trim());
     }
     if let Ok(s) = read_cgroup_file(cgroup_path, "pids.current") {
-        stats.pids_current = s.trim().parse().unwrap_or(0);
+        stats.pids_current = parse_cgroup_number("pids.current", s.trim());
     }
     if let Ok(s) = read_cgroup_file(cgroup_path, "cpu.stat") {
         for line in s.lines() {
             if let Some(value) = line.strip_prefix("usage_usec ") {
-                stats.cpu_usage_usec = value.parse().unwrap_or(0);
+                stats.cpu_usage_usec = parse_cgroup_number("cpu.stat:usage_usec", value);
                 break;
             }
         }
@@ -280,9 +295,29 @@ pub fn format_memory_size(bytes: u64) -> String {
     }
 }
 
+fn parse_cgroup_number(field: &str, value: &str) -> u64 {
+    match value.parse::<u64>() {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, field, raw = value, "failed to parse cgroup stat");
+            0
+        }
+    }
+}
+
+fn log_best_effort<T, E>(action: &str, result: Result<T, E>)
+where
+    E: std::fmt::Display,
+{
+    if let Err(error) = result {
+        tracing::debug!(%error, action, "best-effort cgroup operation failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_parse_memory_size() {
@@ -305,5 +340,24 @@ mod tests {
     #[test]
     fn test_cgroup_v2_check() {
         let _ = is_cgroup_v2_available();
+    }
+
+    #[test]
+    fn get_cgroup_stats_defaults_invalid_numbers_to_zero() {
+        let tempdir = TempDir::new().expect("tempdir should be created");
+        std::fs::write(tempdir.path().join("memory.current"), "invalid")
+            .expect("memory.current should be written");
+        std::fs::write(tempdir.path().join("memory.peak"), "123")
+            .expect("memory.peak should be written");
+        std::fs::write(tempdir.path().join("pids.current"), "bad")
+            .expect("pids.current should be written");
+        std::fs::write(tempdir.path().join("cpu.stat"), "usage_usec nope\n")
+            .expect("cpu.stat should be written");
+
+        let stats = get_cgroup_stats(tempdir.path()).expect("cgroup stats should be read");
+        assert_eq!(stats.memory_current, 0);
+        assert_eq!(stats.memory_peak, 123);
+        assert_eq!(stats.pids_current, 0);
+        assert_eq!(stats.cpu_usage_usec, 0);
     }
 }

@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -41,7 +41,6 @@ clap = { version = "4", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4"] }
 parking_lot = "0.12"
 shell-words = "1"
-futures = "0.3"
 libc = "0.2"
 axum = { version = "0.8", features = ["json"] }
 nix = { version = "0.29", features = ["process", "mount", "sched", "signal", "user", "fs"] }

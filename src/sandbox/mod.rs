@@ -1,21 +1,26 @@
 //! Sandbox implementation with namespace isolation.
 
 pub mod cgroup;
+mod mounts;
 pub mod namespace;
+mod output;
 pub mod overlay;
+mod process;
 pub mod seccomp;
 
-use crate::config::{PoolConfig, ResourceLimits, SeccompPolicy};
+use crate::config::{OverlayDriver, PoolConfig, ResourceLimits, SeccompPolicy};
 use crate::task::{MountSpec, Task, TaskResult};
+use mounts::overlay_base_dir;
 use overlay::ActiveOverlay;
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
-const OUTPUT_READ_BUFFER_SIZE: usize = 8192;
+use self::output::{append_capped, read_output_stream};
+use self::process::configure_task_process_linux;
 
 /// Errors that can occur during sandbox operations.
 #[derive(Debug, Error)]
@@ -40,9 +45,6 @@ pub enum SandboxError {
 
     #[error("sandbox execution failed: {0}")]
     ExecutionFailed(String),
-
-    #[error("sandbox execution timed out")]
-    Timeout,
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -150,7 +152,7 @@ impl Sandbox {
     pub async fn initialize(
         &mut self,
         base_image: &Path,
-        driver: &overlay::OverlayDriver,
+        driver: &OverlayDriver,
     ) -> Result<(), SandboxError> {
         self.set_state(SandboxState::Creating);
 
@@ -205,14 +207,14 @@ impl Sandbox {
             .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
 
         match &result {
+            Ok(r) if r.timed_out => {
+                self.stats.timed_out_tasks.fetch_add(1, Ordering::Relaxed);
+            }
             Ok(r) if r.exit_code == 0 => {
                 self.stats.successful_tasks.fetch_add(1, Ordering::Relaxed);
             }
             Ok(_) => {
                 self.stats.failed_tasks.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(SandboxError::Timeout) => {
-                self.stats.timed_out_tasks.fetch_add(1, Ordering::Relaxed);
             }
             Err(_) => {
                 self.stats.failed_tasks.fetch_add(1, Ordering::Relaxed);
@@ -317,8 +319,13 @@ impl Sandbox {
         if let Some(stdin_data) = task.stdin.clone() {
             if let Some(mut stdin) = child.stdin.take() {
                 tokio::spawn(async move {
-                    let _ = stdin.write_all(&stdin_data).await;
-                    let _ = stdin.shutdown().await;
+                    if let Err(error) = stdin.write_all(&stdin_data).await {
+                        tracing::debug!(%error, "failed to write task stdin");
+                        return;
+                    }
+                    if let Err(error) = stdin.shutdown().await {
+                        tracing::debug!(%error, "failed to close task stdin");
+                    }
                 });
             }
         }
@@ -343,16 +350,26 @@ impl Sandbox {
             Ok(Err(e)) => return Err(SandboxError::ExecutionFailed(e.to_string())),
             Err(_) => {
                 if let Some(cgroup_path) = &self.cgroup_path {
-                    let _ = cgroup::kill_cgroup_processes(cgroup_path);
-                }
-                if let Some(pid) = child.id() {
-                    let _ = nix::sys::signal::killpg(
-                        nix::unistd::Pid::from_raw(pid as i32),
-                        nix::sys::signal::Signal::SIGKILL,
+                    log_best_effort(
+                        "kill timed-out task cgroup",
+                        cgroup::kill_cgroup_processes(cgroup_path),
                     );
                 }
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                if let Some(pid) = child.id() {
+                    log_best_effort(
+                        "kill timed-out task process group",
+                        nix::sys::signal::killpg(
+                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::sys::signal::Signal::SIGKILL,
+                        ),
+                    );
+                }
+                if let Err(error) = child.kill().await {
+                    tracing::debug!(%error, "failed to kill timed-out child process");
+                }
+                if let Err(error) = child.wait().await {
+                    tracing::debug!(%error, "failed to reap timed-out child process");
+                }
                 (-1, true)
             }
         };
@@ -398,9 +415,18 @@ impl Sandbox {
         self.set_state(SandboxState::Resetting);
 
         if let Some(pid) = self.init_pid.lock().take() {
-            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
-            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-            let _ = nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+            log_best_effort(
+                "kill running sandbox process group during reset",
+                nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL),
+            );
+            log_best_effort(
+                "kill running sandbox process during reset",
+                nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL),
+            );
+            log_best_effort(
+                "reap running sandbox process during reset",
+                nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            );
         }
 
         if let Some(ref cgroup_path) = self.cgroup_path {
@@ -420,16 +446,37 @@ impl Sandbox {
     pub fn cleanup(&self) -> Result<(), SandboxError> {
         if let Some(ref active) = *self.active_overlay.lock() {
             if self.root_path.exists() {
-                let _ = overlay::unmount_overlay(&self.root_path, active);
+                log_best_effort(
+                    "unmount sandbox overlay during cleanup",
+                    overlay::unmount_overlay(&self.root_path, active),
+                );
             }
         }
 
         if let Some(ref cgroup_path) = self.cgroup_path {
-            let _ = cgroup::remove_cgroup(cgroup_path);
+            log_best_effort(
+                "remove sandbox cgroup during cleanup",
+                cgroup::remove_cgroup(cgroup_path),
+            );
         }
 
-        let overlay_base = self.root_path.parent().unwrap_or(&self.root_path);
-        let _ = std::fs::remove_dir_all(overlay_base);
+        match overlay_base_dir(&self.root_path) {
+            Some(overlay_base) => {
+                if let Err(error) = std::fs::remove_dir_all(overlay_base) {
+                    tracing::debug!(
+                        %error,
+                        overlay_base = %overlay_base.display(),
+                        "failed to remove sandbox overlay base"
+                    );
+                }
+            }
+            None => {
+                tracing::warn!(
+                    root_path = %self.root_path.display(),
+                    "skipping sandbox cleanup because the overlay base is unsafe"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -445,216 +492,11 @@ impl Drop for Sandbox {
     }
 }
 
-/// Write a message to stderr using async-signal-safe `libc::write`.
-/// Safe to call from a `pre_exec` (post-fork, pre-exec) context.
-fn write_stderr_safe(msg: &[u8]) {
-    unsafe {
-        libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
-    }
-}
-
-fn configure_task_process_linux(
-    root: &Path,
-    workdir: &Path,
-    cgroup_path: Option<&Path>,
-    enable_seccomp: bool,
-    seccomp_policy: &SeccompPolicy,
-    uid: Option<u32>,
-    gid: Option<u32>,
-    writable_mounts: &[MountSpec],
-    readonly_mounts: &[MountSpec],
-) -> std::io::Result<()> {
-    // NOTE: This function runs in a forked child before exec().
-    // Only async-signal-safe functions may be called. In particular,
-    // tracing/log macros, heap allocation, and lock acquisition are
-    // forbidden. Use write_stderr_safe() for diagnostics.
-    use nix::mount::{mount, umount2, MntFlags, MsFlags};
-    use nix::sched::{unshare, CloneFlags};
-
-    if unsafe { libc::setpgid(0, 0) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    if let Some(cgroup_path) = cgroup_path {
-        if cgroup::add_process_to_cgroup(cgroup_path, std::process::id()).is_err() {
-            write_stderr_safe(b"[apiary] warning: failed to attach process to cgroup\n");
-        }
-    }
-
-    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS)
-        .map_err(|e| std::io::Error::other(format!("failed to unshare task namespaces: {e}")))?;
-    namespace::make_mount_private().map_err(sandbox_error_to_io)?;
-
-    mount(
-        Some(root),
-        root,
-        None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_REC,
-        None::<&str>,
-    )
-    .map_err(|e| std::io::Error::other(format!("failed to bind mount new root: {e}")))?;
-
-    apply_task_mounts(root, writable_mounts, readonly_mounts)?;
-
-    if overlay::setup_dev_mounts(root).is_err() {
-        write_stderr_safe(b"[apiary] warning: failed to setup /dev; continuing\n");
-    }
-
-    let put_old = root.join(".old_root");
-    std::fs::create_dir_all(&put_old)?;
-    namespace::pivot_root(root, &put_old).map_err(sandbox_error_to_io)?;
-    umount2("/.old_root", MntFlags::MNT_DETACH)
-        .map_err(|e| std::io::Error::other(format!("failed to unmount old root: {e}")))?;
-    let _ = std::fs::remove_dir_all("/.old_root");
-
-    if overlay::setup_post_pivot_mounts(Path::new("/")).is_err() {
-        write_stderr_safe(b"[apiary] warning: failed to mount pseudo-filesystems; continuing\n");
-    }
-
-    let effective_workdir = if workdir.is_absolute() {
-        workdir.to_path_buf()
-    } else {
-        Path::new("/").join(workdir)
-    };
-    std::fs::create_dir_all(&effective_workdir)?;
-    std::env::set_current_dir(&effective_workdir)?;
-
-    if let Some(gid) = gid {
-        if unsafe { libc::setgid(gid) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    if let Some(uid) = uid {
-        if unsafe { libc::setuid(uid) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-
-    if enable_seccomp {
-        if seccomp::set_no_new_privs().is_err() {
-            write_stderr_safe(
-                b"[apiary] warning: failed to set no_new_privs; continuing without seccomp\n",
-            );
-        } else if seccomp::apply_seccomp_filter(seccomp_policy).is_err() {
-            write_stderr_safe(b"[apiary] warning: failed to apply seccomp filter; continuing\n");
-        }
-    }
-
-    Ok(())
-}
-
-fn apply_task_mounts(
-    root: &Path,
-    writable_mounts: &[MountSpec],
-    readonly_mounts: &[MountSpec],
-) -> std::io::Result<()> {
-    for spec in writable_mounts {
-        bind_mount_spec(root, spec, false)?;
-    }
-    for spec in readonly_mounts {
-        bind_mount_spec(root, spec, true)?;
-    }
-    Ok(())
-}
-
-fn bind_mount_spec(root: &Path, spec: &MountSpec, readonly: bool) -> std::io::Result<()> {
-    use nix::mount::{mount, MsFlags};
-
-    if !spec.source.exists() {
-        return Err(std::io::Error::other(format!(
-            "mount source does not exist: {}",
-            spec.source.display()
-        )));
-    }
-
-    let target = root.join(spec.dest.strip_prefix("/").unwrap_or(&spec.dest));
-    std::fs::create_dir_all(&target)?;
-
-    mount(
-        Some(&spec.source),
-        &target,
-        None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_REC,
-        None::<&str>,
-    )
-    .map_err(|e| {
-        std::io::Error::other(format!(
-            "failed to bind mount {} -> {}: {e}",
-            spec.source.display(),
-            spec.dest.display()
-        ))
-    })?;
-
-    if readonly {
-        mount(
-            None::<&str>,
-            &target,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_REC,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            std::io::Error::other(format!(
-                "failed to remount {} as read-only: {e}",
-                spec.dest.display()
-            ))
-        })?;
-    }
-
-    Ok(())
-}
-
-fn sandbox_error_to_io(error: SandboxError) -> std::io::Error {
-    std::io::Error::other(error.to_string())
-}
-
-async fn read_output_stream<R>(
-    reader: Option<R>,
-    capture: bool,
-    max_output_size: usize,
-) -> std::io::Result<Vec<u8>>
+fn log_best_effort<T, E>(action: &str, result: Result<T, E>)
 where
-    R: AsyncRead + Unpin,
+    E: std::fmt::Display,
 {
-    let Some(mut reader) = reader else {
-        return Ok(Vec::new());
-    };
-
-    let mut captured = Vec::new();
-    let mut buffer = [0_u8; OUTPUT_READ_BUFFER_SIZE];
-    let mut truncated = false;
-
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-
-        if capture && !truncated {
-            let chunk = &buffer[..read];
-            let available = max_output_size.saturating_sub(captured.len());
-            if available == 0 {
-                truncated = true;
-                continue;
-            }
-
-            let to_copy = available.min(chunk.len());
-            captured.extend_from_slice(&chunk[..to_copy]);
-            if to_copy < chunk.len() {
-                truncated = true;
-            }
-        }
+    if let Err(error) = result {
+        tracing::debug!(%error, action, "best-effort sandbox cleanup failed");
     }
-
-    Ok(captured)
-}
-
-fn append_capped(target: &mut Vec<u8>, chunk: &[u8], max_output_size: usize) {
-    let available = max_output_size.saturating_sub(target.len());
-    if available == 0 {
-        return;
-    }
-
-    let to_copy = available.min(chunk.len());
-    target.extend_from_slice(&chunk[..to_copy]);
 }
