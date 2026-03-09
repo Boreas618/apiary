@@ -101,7 +101,7 @@ enum Commands {
         tasks: PathBuf,
 
         /// Maximum parallel tasks
-        #[arg(long, default_value = "10", value_parser = clap::value_parser!(usize).range(1..))]
+        #[arg(long, default_value = "10")]
         parallelism: usize,
     },
 

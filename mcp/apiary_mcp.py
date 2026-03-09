@@ -43,7 +43,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 logging.basicConfig(level=logging.INFO)
@@ -478,16 +478,14 @@ def create_starlette_app(
 ) -> Starlette:
     sse = SseServerTransport("/messages/")
 
-    async def handle_sse(request: Request) -> None:
+    async def handle_sse(request: Request):
         if _mcp_auth_token:
             provided = request.headers.get("authorization", "")
             expected = f"Bearer {_mcp_auth_token}"
             if not hmac.compare_digest(provided.encode(), expected.encode()):
-                resp = JSONResponse(
+                return JSONResponse(
                     {"error": "unauthorized"}, status_code=401
                 )
-                await resp(request.scope, request.receive, request._send)
-                return
 
         cid = request.query_params.get("client_id") or uuid.uuid4().hex[:12]
         _client_id.set(cid)
@@ -517,6 +515,16 @@ def create_starlette_app(
                     _session._refcounts.get(cid, 0),
                 )
 
+        return Response()
+
+    async def handle_health(_: Request):
+        return JSONResponse(
+            {
+                "status": "ok",
+                "sessions": _session.active_sessions,
+            }
+        )
+
     async def on_startup():
         _session.start_reaper()
 
@@ -526,7 +534,8 @@ def create_starlette_app(
     return Starlette(
         debug=debug,
         routes=[
-            Route("/sse", endpoint=handle_sse),
+            Route("/health", endpoint=handle_health, methods=["GET"]),
+            Route("/sse", endpoint=handle_sse, methods=["GET"]),
             Mount("/messages/", app=sse.handle_post_message),
         ],
         on_startup=[on_startup],

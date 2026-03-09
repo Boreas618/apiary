@@ -252,11 +252,10 @@ impl Pool {
     }
 }
 
-impl Drop for Pool {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-    }
-}
+// NOTE: Pool is Clone (all Arc fields) so Drop must NOT set the shared
+// shutdown flag — axum clones the state for every request and drops it
+// when the handler returns, which would poison the pool after the first
+// request.  Use pool.shutdown().await for explicit teardown instead.
 
 #[cfg(test)]
 mod tests {
