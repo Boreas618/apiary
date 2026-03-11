@@ -5,7 +5,9 @@ use crate::config::{ResourceLimits, SeccompPolicy};
 use crate::task::MountSpec;
 
 use super::mounts::apply_task_mounts;
-use super::{cgroup, namespace, overlay, rlimits, seccomp, SandboxError};
+#[cfg(target_os = "linux")]
+use super::seccomp;
+use super::{cgroup, namespace, overlay, rlimits, SandboxError};
 
 pub(super) fn configure_task_process_linux(
     root: &Path,
@@ -90,14 +92,17 @@ pub(super) fn configure_task_process_linux(
         }
     }
 
-    if seccomp::set_no_new_privs().is_err() {
-        write_stderr_safe(
-            b"[apiary] warning: failed to set no_new_privs; continuing without seccomp\n",
-        );
-    } else if seccomp::apply_seccomp_filter(seccomp_policy).is_err() {
-        write_stderr_safe(
-            b"[apiary] warning: failed to apply seccomp filter; continuing without seccomp\n",
-        );
+    #[cfg(target_os = "linux")]
+    {
+        if seccomp::set_no_new_privs().is_err() {
+            write_stderr_safe(
+                b"[apiary] warning: failed to set no_new_privs; continuing without seccomp\n",
+            );
+        } else if seccomp::apply_seccomp_filter(seccomp_policy).is_err() {
+            write_stderr_safe(
+                b"[apiary] warning: failed to apply seccomp filter; continuing without seccomp\n",
+            );
+        }
     }
 
     Ok(())

@@ -8,6 +8,7 @@ mod output;
 pub mod overlay;
 mod process;
 pub mod rlimits;
+#[cfg(target_os = "linux")]
 pub mod seccomp;
 
 use crate::config::{OverlayDriver, PoolConfig, ResourceLimits, SeccompPolicy};
