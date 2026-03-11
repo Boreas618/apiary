@@ -1,15 +1,18 @@
 //! Sandbox implementation with namespace isolation.
 
 pub mod cgroup;
+pub mod monitor;
 mod mounts;
 pub mod namespace;
 mod output;
 pub mod overlay;
 mod process;
+pub mod rlimits;
 pub mod seccomp;
 
 use crate::config::{OverlayDriver, PoolConfig, ResourceLimits, SeccompPolicy};
 use crate::task::{MountSpec, Task, TaskResult};
+use monitor::ProcessMonitor;
 use mounts::overlay_base_dir;
 use overlay::ActiveOverlay;
 use parking_lot::Mutex;
@@ -91,6 +94,7 @@ pub struct Sandbox {
     cgroup_path: Option<PathBuf>,
     active_overlay: Mutex<Option<ActiveOverlay>>,
     stats: SandboxStats,
+    process_monitor: Option<ProcessMonitor>,
 }
 
 /// Statistics for a sandbox.
@@ -127,6 +131,7 @@ impl Sandbox {
             cgroup_path: None,
             active_overlay: Mutex::new(None),
             stats: SandboxStats::default(),
+            process_monitor: None,
         })
     }
 
@@ -144,6 +149,13 @@ impl Sandbox {
 
     pub fn root_path(&self) -> &Path {
         &self.root_path
+    }
+
+    /// Attach a shared process monitor (typically created by the Pool).
+    /// When set before `initialize()`, this monitor is used instead of
+    /// spawning a per-sandbox monitor when cgroups are unavailable.
+    pub fn set_process_monitor(&mut self, monitor: ProcessMonitor) {
+        self.process_monitor = Some(monitor);
     }
 
     /// Initialize the sandbox.
@@ -175,7 +187,16 @@ impl Sandbox {
                 self.cgroup_path = Some(path);
             }
             Err(e) => {
-                tracing::warn!("Failed to setup cgroup (may need root or delegation): {e}");
+                tracing::warn!(
+                    "Failed to setup cgroup (falling back to rlimits + process monitor): {e}"
+                );
+                if self.process_monitor.is_none() {
+                    self.process_monitor = Some(ProcessMonitor::spawn());
+                    tracing::info!(
+                        sandbox_id = %self.id,
+                        "started process monitor as cgroup fallback"
+                    );
+                }
             }
         }
 
@@ -248,6 +269,8 @@ impl Sandbox {
             .unwrap_or_else(|| PathBuf::from("/workspace"));
         let cgroup_path = self.cgroup_path.clone();
         let seccomp_policy = self.seccomp_policy.clone();
+        let resource_limits = self.resource_limits.clone();
+        let task_timeout = task.timeout;
         let task_uid = task.uid;
         let task_gid = task.gid;
         let writable_mounts = task.writable_mounts.clone();
@@ -286,6 +309,8 @@ impl Sandbox {
                     &workdir,
                     cgroup_path.as_deref(),
                     &seccomp_policy,
+                    &resource_limits,
+                    task_timeout,
                     task_uid,
                     task_gid,
                     &writable_mounts,
@@ -297,7 +322,8 @@ impl Sandbox {
         let mut child = cmd
             .spawn()
             .map_err(|e| SandboxError::SpawnFailed(format!("failed to spawn process: {e}")))?;
-        if let Some(pid) = child.id() {
+        let child_pid = child.id();
+        if let Some(pid) = child_pid {
             *self.init_pid.lock() = Some(nix::unistd::Pid::from_raw(pid as i32));
         }
         struct RunningPidGuard<'a> {
@@ -311,6 +337,11 @@ impl Sandbox {
         let _running_pid_guard = RunningPidGuard {
             slot: &self.init_pid,
         };
+
+        if let (Some(monitor), Some(pid)) = (&self.process_monitor, child_pid) {
+            let limits = monitor::limits_from_config(&self.resource_limits);
+            monitor.register(pid, pid, limits).await;
+        }
 
         if let Some(stdin_data) = task.stdin.clone() {
             if let Some(mut stdin) = child.stdin.take() {
@@ -369,6 +400,10 @@ impl Sandbox {
                 (-1, true)
             }
         };
+
+        if let (Some(monitor), Some(pid)) = (&self.process_monitor, child_pid) {
+            monitor.unregister(pid).await;
+        }
 
         let mut stdout = match stdout_handle.await {
             Ok(Ok(output)) => output,

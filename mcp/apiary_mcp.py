@@ -10,7 +10,7 @@ Client identity & session lifecycle:
       Sandboxes survive reconnections: as long as the same ``client_id`` is
       reused, the sandbox (and all filesystem state inside it) is preserved.
       Sandboxes with no active connection are reaped after an idle timeout
-      (default 30 min, configurable via ``--idle-timeout``).
+      (default 5 min, configurable via ``--idle-timeout``).
     * stdio — a single sandbox for the sole client (implicit ``client_id``).
 
 If a sandbox session is lost server-side (Apiary returns 404), it is
@@ -51,9 +51,9 @@ LOGGER = logging.getLogger(__name__)
 
 mcp = FastMCP("apiary_sandbox")
 
-# Carries the current client identity into tool handlers.
-# In SSE mode each connection sets it to the client_id from the query string;
-# in stdio mode the default is used since there is only one client.
+# Per-connection client identity, set by the SSE handler and read by tool
+# handlers.  Safe because each SSE connection runs in its own asyncio Task
+# (created by uvicorn), and ContextVar is per-Task in asyncio.
 _client_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_client_id", default="stdio"
 )
@@ -96,8 +96,6 @@ class SessionManager:
         self._client: Optional[httpx.AsyncClient] = None
         self._reaper_task: Optional[asyncio.Task] = None
 
-    # -- HTTP client --
-
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -107,17 +105,18 @@ class SessionManager:
                 base_url=self._base_url,
                 headers=headers,
                 timeout=httpx.Timeout(timeout=300.0),
+                limits=httpx.Limits(
+                    max_connections=500,
+                    max_keepalive_connections=200,
+                    keepalive_expiry=30.0,
+                ),
             )
         return self._client
-
-    # -- Per-client lock --
 
     def _lock_for(self, cid: str) -> asyncio.Lock:
         if cid not in self._locks:
             self._locks[cid] = asyncio.Lock()
         return self._locks[cid]
-
-    # -- Apiary session helpers --
 
     async def _create_apiary_session(self) -> str:
         client = await self._get_client()
@@ -138,8 +137,6 @@ class SessionManager:
                 session_id,
                 exc_info=True,
             )
-
-    # -- Session lifecycle --
 
     async def _ensure_session(self, cid: str) -> str:
         lock = self._lock_for(cid)
@@ -170,24 +167,17 @@ class SessionManager:
                 len(self._sessions),
             )
 
-    # -- Connection ref-counting --
-
     def attach(self, cid: str) -> None:
-        """Register a new SSE connection for *cid*."""
         self._refcounts[cid] = self._refcounts.get(cid, 0) + 1
         self._detached_at.pop(cid, None)
 
     def detach(self, cid: str) -> None:
-        """Un-register an SSE connection.  Starts the idle timer when the
-        last connection for *cid* closes."""
         count = self._refcounts.get(cid, 1) - 1
         if count <= 0:
             self._refcounts.pop(cid, None)
             self._detached_at[cid] = time.monotonic()
         else:
             self._refcounts[cid] = count
-
-    # -- Idle reaper --
 
     def start_reaper(self) -> None:
         if self._reaper_task is None:
@@ -208,8 +198,6 @@ class SessionManager:
                     LOGGER.info("Reaping idle client %s", cid)
                     await self._destroy_client(cid)
 
-    # -- Command execution --
-
     async def execute(
         self,
         command: str,
@@ -218,11 +206,7 @@ class SessionManager:
         working_dir: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
     ) -> dict:
-        """Run *command* (interpreted by ``bash -c``) in the caller's sandbox.
-
-        The caller is identified via the ``_client_id`` context variable that
-        the transport layer sets for each connection.
-        """
+        """Run *command* in the caller's sandbox."""
         cid = _client_id.get()
         wrapped = f"bash -c {shlex.quote(command)}"
         session_id = await self._ensure_session(cid)
@@ -253,8 +237,6 @@ class SessionManager:
 
         resp.raise_for_status()
         return resp.json()
-
-    # -- Shutdown --
 
     async def shutdown(self) -> None:
         if self._reaper_task:
@@ -303,12 +285,11 @@ def _fmt(result: dict) -> str:
 
 
 def _q(value: str) -> str:
-    """Shell-quote a value for safe interpolation inside ``bash -c``."""
     return shlex.quote(value)
 
 
 # ---------------------------------------------------------------------------
-# Tool: shell execution
+# Tools
 # ---------------------------------------------------------------------------
 
 
@@ -333,11 +314,6 @@ async def shell_exec(
         command, timeout_ms=timeout_ms, working_dir=working_dir
     )
     return _fmt(result)
-
-
-# ---------------------------------------------------------------------------
-# Tools: file operations
-# ---------------------------------------------------------------------------
 
 
 @mcp.tool()
@@ -547,7 +523,21 @@ def create_starlette_app(
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _install_uvloop() -> bool:
+    try:
+        import uvloop  # type: ignore[import-untyped]
+
+        uvloop.install()
+        LOGGER.info("Using uvloop event loop")
+        return True
+    except ImportError:
+        LOGGER.info("uvloop not available, using default asyncio event loop")
+        return False
+
+
 if __name__ == "__main__":
+    _install_uvloop()
+
     parser = argparse.ArgumentParser(
         description="MCP server for shell & file operations in Apiary sandboxes"
     )
@@ -587,6 +577,18 @@ if __name__ == "__main__":
         default="sse",
         help="MCP transport (default: sse)",
     )
+    parser.add_argument(
+        "--backlog",
+        type=int,
+        default=2048,
+        help="TCP listen backlog (default 2048)",
+    )
+    parser.add_argument(
+        "--limit-concurrency",
+        type=int,
+        default=500,
+        help="Max concurrent connections (default 500)",
+    )
     args = parser.parse_args()
 
     _session = SessionManager(
@@ -601,4 +603,12 @@ if __name__ == "__main__":
         mcp.run(transport="stdio")
     else:
         starlette_app = create_starlette_app(mcp._mcp_server, debug=True)
-        uvicorn.run(starlette_app, host=args.host, port=args.port)
+        uvicorn.run(
+            starlette_app,
+            host=args.host,
+            port=args.port,
+            backlog=args.backlog,
+            limit_concurrency=args.limit_concurrency,
+            timeout_keep_alive=30,
+            log_level="info",
+        )

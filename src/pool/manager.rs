@@ -17,7 +17,8 @@ use tokio::sync::Notify;
 
 use super::session::SessionHandle;
 use crate::config::PoolConfig;
-use crate::sandbox::{Sandbox, SandboxError, SandboxState};
+use crate::sandbox::monitor::ProcessMonitor;
+use crate::sandbox::{cgroup, Sandbox, SandboxError, SandboxState};
 
 /// When the pool is at max capacity, how long `create_session` waits for an
 /// idle sandbox before giving up.
@@ -85,10 +86,23 @@ pub struct Pool {
     pub(super) next_sandbox_id: Arc<AtomicUsize>,
     pub(super) last_scale_event: Arc<Mutex<Instant>>,
     pub(super) idle_since: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Shared process monitor for resource enforcement when cgroups are
+    /// unavailable. Created once during pool init and injected into every
+    /// sandbox so a single background task polls all tracked processes.
+    pub(super) process_monitor: Option<ProcessMonitor>,
 }
 
 impl Pool {
     pub async fn new(config: PoolConfig) -> Result<Self, PoolError> {
+        let monitor = if !cgroup::has_delegated_cgroup() {
+            tracing::info!(
+                "cgroups unavailable; starting shared process monitor for resource enforcement"
+            );
+            Some(ProcessMonitor::spawn())
+        } else {
+            None
+        };
+
         let pool = Self {
             config: Arc::new(config),
             sandboxes: Arc::new(RwLock::new(HashMap::new())),
@@ -99,6 +113,7 @@ impl Pool {
             next_sandbox_id: Arc::new(AtomicUsize::new(0)),
             last_scale_event: Arc::new(Mutex::new(Instant::now())),
             idle_since: Arc::new(RwLock::new(HashMap::new())),
+            process_monitor: monitor,
         };
 
         pool.initialize_sandboxes().await?;
@@ -142,6 +157,10 @@ impl Pool {
 
         let mut sandbox = Sandbox::new(sandbox_id.clone(), &self.config)
             .map_err(|e| PoolError::InitFailed(e.to_string()))?;
+
+        if let Some(ref monitor) = self.process_monitor {
+            sandbox.set_process_monitor(monitor.clone());
+        }
 
         sandbox
             .initialize(&self.config.base_image, &self.config.overlay_driver)
@@ -235,6 +254,10 @@ impl Pool {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        if let Some(ref monitor) = self.process_monitor {
+            monitor.shutdown().await;
         }
 
         let sandboxes = self.sandboxes.read();

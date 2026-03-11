@@ -1,16 +1,19 @@
 use std::path::Path;
+use std::time::Duration;
 
-use crate::config::SeccompPolicy;
+use crate::config::{ResourceLimits, SeccompPolicy};
 use crate::task::MountSpec;
 
 use super::mounts::apply_task_mounts;
-use super::{cgroup, namespace, overlay, seccomp, SandboxError};
+use super::{cgroup, namespace, overlay, rlimits, seccomp, SandboxError};
 
 pub(super) fn configure_task_process_linux(
     root: &Path,
     workdir: &Path,
     cgroup_path: Option<&Path>,
     seccomp_policy: &SeccompPolicy,
+    resource_limits: &ResourceLimits,
+    timeout: Duration,
     uid: Option<u32>,
     gid: Option<u32>,
     writable_mounts: &[MountSpec],
@@ -31,6 +34,11 @@ pub(super) fn configure_task_process_linux(
         if cgroup::add_process_to_cgroup(cgroup_path, std::process::id()).is_err() {
             write_stderr_safe(b"[apiary] warning: failed to attach process to cgroup\n");
         }
+    }
+
+    // Apply rlimits unconditionally (defense-in-depth: works even without cgroups).
+    if rlimits::apply_rlimits(resource_limits, timeout).is_err() {
+        write_stderr_safe(b"[apiary] warning: failed to apply rlimits; continuing\n");
     }
 
     unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS)
@@ -97,7 +105,7 @@ pub(super) fn configure_task_process_linux(
 
 /// Write a message to stderr using async-signal-safe `libc::write`.
 /// Safe to call from a `pre_exec` (post-fork, pre-exec) context.
-fn write_stderr_safe(msg: &[u8]) {
+pub(super) fn write_stderr_safe(msg: &[u8]) {
     unsafe {
         libc::write(
             libc::STDERR_FILENO,

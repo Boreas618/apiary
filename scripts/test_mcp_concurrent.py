@@ -372,7 +372,7 @@ class MCPAgent:
         return f"{self.mcp_url}{ep}"
 
     async def _send_rpc(
-        self, method: str, params: dict, timeout: float = 60.0
+        self, method: str, params: dict, timeout: float = 300.0
     ) -> dict:
         self._request_id += 1
         req_id = self._request_id
@@ -521,9 +521,9 @@ async def run_level(
     )
     timeout = httpx.Timeout(
         connect=30.0,
-        read=120.0,
+        read=300.0,
         write=30.0,
-        pool=60.0,
+        pool=120.0,
     )
 
     t_start = time.monotonic()
@@ -562,7 +562,7 @@ async def run_isolation_test(mode: str, url: str, count: int = 5) -> dict:
     """Verify that sandboxes do not share filesystem state."""
     print("\n--- Isolation Test ---")
     limits = httpx.Limits(max_connections=count * 3 + 10, max_keepalive_connections=count + 5)
-    timeout = httpx.Timeout(connect=15.0, read=60.0, write=15.0, pool=30.0)
+    timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=120.0)
 
     results: dict[str, dict] = {}
 

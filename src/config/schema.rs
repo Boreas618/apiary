@@ -110,11 +110,17 @@ impl Default for PoolConfig {
     }
 }
 
-/// Resource limits for cgroups v2.
+/// Resource limits applied via cgroups v2 and/or `setrlimit`.
+///
+/// The cgroup fields (`memory_max`, `cpu_max`, `pids_max`, `io_max`) are
+/// written to cgroup control files when cgroups are available. The rlimit
+/// fields (`max_file_size`, `max_open_files`, `rlimit_as_multiplier`) are
+/// always applied via `setrlimit` in the child process (defense-in-depth).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceLimits {
     /// Maximum memory in bytes (e.g., "2G", "512M").
+    /// Used for cgroup `memory.max` and as the base for `RLIMIT_AS`.
     #[serde(default = "default_memory_max")]
     pub memory_max: String,
 
@@ -123,12 +129,28 @@ pub struct ResourceLimits {
     pub cpu_max: String,
 
     /// Maximum number of PIDs.
+    /// Used for cgroup `pids.max` and `RLIMIT_NPROC`.
     #[serde(default = "default_pids_max")]
     pub pids_max: u64,
 
     /// I/O limits (device major:minor rbps=N wbps=N).
     #[serde(default)]
     pub io_max: Option<String>,
+
+    /// Max file size a process can write (e.g., "1G"). Applied via `RLIMIT_FSIZE`.
+    #[serde(default)]
+    pub max_file_size: Option<String>,
+
+    /// Max open file descriptors per process. Applied via `RLIMIT_NOFILE`.
+    #[serde(default = "default_max_open_files")]
+    pub max_open_files: u64,
+
+    /// Multiplier for `memory_max` when deriving `RLIMIT_AS` (default: 2).
+    /// Virtual address space is typically much larger than RSS, so the
+    /// multiplier avoids false OOM kills from programs like Python/Java
+    /// that mmap large regions without actually using them.
+    #[serde(default = "default_rlimit_as_multiplier")]
+    pub rlimit_as_multiplier: u64,
 }
 
 fn default_memory_max() -> String {
@@ -143,6 +165,14 @@ fn default_pids_max() -> u64 {
     256
 }
 
+fn default_max_open_files() -> u64 {
+    1024
+}
+
+fn default_rlimit_as_multiplier() -> u64 {
+    2
+}
+
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
@@ -150,6 +180,9 @@ impl Default for ResourceLimits {
             cpu_max: default_cpu_max(),
             pids_max: default_pids_max(),
             io_max: None,
+            max_file_size: None,
+            max_open_files: default_max_open_files(),
+            rlimit_as_multiplier: default_rlimit_as_multiplier(),
         }
     }
 }
@@ -335,7 +368,7 @@ impl PoolConfigBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::PoolConfig;
+    use super::{PoolConfig, ResourceLimits};
 
     #[test]
     fn unknown_top_level_field_is_rejected() {
@@ -349,6 +382,75 @@ unexpected_field = true
         .expect_err("unknown config fields must be rejected");
 
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn resource_limits_defaults_are_sane() {
+        let limits = ResourceLimits::default();
+        assert_eq!(limits.memory_max, "2G");
+        assert_eq!(limits.pids_max, 256);
+        assert_eq!(limits.max_open_files, 1024);
+        assert_eq!(limits.rlimit_as_multiplier, 2);
+        assert!(limits.max_file_size.is_none());
+        assert!(limits.io_max.is_none());
+    }
+
+    #[test]
+    fn resource_limits_deserialize_with_new_fields() {
+        let limits: ResourceLimits = toml::from_str(
+            r#"
+memory_max = "4G"
+pids_max = 512
+max_file_size = "1G"
+max_open_files = 2048
+rlimit_as_multiplier = 3
+"#,
+        )
+        .expect("should deserialize with rlimit fields");
+
+        assert_eq!(limits.memory_max, "4G");
+        assert_eq!(limits.pids_max, 512);
+        assert_eq!(limits.max_file_size, Some("1G".to_string()));
+        assert_eq!(limits.max_open_files, 2048);
+        assert_eq!(limits.rlimit_as_multiplier, 3);
+    }
+
+    #[test]
+    fn resource_limits_deserialize_omitted_new_fields() {
+        let limits: ResourceLimits = toml::from_str(
+            r#"
+memory_max = "1G"
+"#,
+        )
+        .expect("should deserialize with defaults for rlimit fields");
+
+        assert_eq!(limits.memory_max, "1G");
+        assert_eq!(limits.max_open_files, 1024);
+        assert_eq!(limits.rlimit_as_multiplier, 2);
+        assert!(limits.max_file_size.is_none());
+    }
+
+    #[test]
+    fn pool_config_with_rlimit_fields() {
+        let config: PoolConfig = toml::from_str(
+            r#"
+base_image = "/tmp/rootfs"
+overlay_dir = "/tmp/overlays"
+
+[resource_limits]
+memory_max = "8G"
+max_file_size = "2G"
+rlimit_as_multiplier = 4
+"#,
+        )
+        .expect("pool config should accept rlimit fields in resource_limits");
+
+        assert_eq!(config.resource_limits.memory_max, "8G");
+        assert_eq!(
+            config.resource_limits.max_file_size,
+            Some("2G".to_string())
+        );
+        assert_eq!(config.resource_limits.rlimit_as_multiplier, 4);
     }
 }
 

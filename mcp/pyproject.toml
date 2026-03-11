@@ -8,4 +8,5 @@ dependencies = [
     "mcp>=1.26.0",
     "starlette>=0.52.1",
     "uvicorn>=0.41.0",
+    "uvloop>=0.21.0",
 ]

@@ -287,6 +287,7 @@ mod tests {
             next_sandbox_id: Arc::new(AtomicUsize::new(0)),
             last_scale_event: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
             idle_since: Arc::new(RwLock::new(HashMap::new())),
+            process_monitor: None,
         };
 
         (pool, tempdir)
