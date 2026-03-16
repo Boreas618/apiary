@@ -38,6 +38,8 @@ struct ExecuteTaskRequest {
 struct CreateSessionRequest {
     #[serde(default)]
     working_dir: Option<PathBuf>,
+    #[serde(default)]
+    base_image: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -154,10 +156,13 @@ async fn create_session(
     payload: Option<Json<CreateSessionRequest>>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
     let payload = payload.map(|Json(payload)| payload).unwrap_or_default();
-    let session_options = payload
+    let mut session_options = payload
         .working_dir
         .map(|working_dir| SessionOptions::default().working_dir(working_dir))
         .unwrap_or_default();
+    if let Some(base_image) = payload.base_image {
+        session_options = session_options.base_image(base_image);
+    }
     let session_id = state
         .pool
         .create_session(session_options)

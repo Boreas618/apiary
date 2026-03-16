@@ -12,12 +12,24 @@ use crate::task::{Task, TaskResult};
 pub struct SessionOptions {
     /// Default working directory for tasks executed in this session.
     pub working_dir: Option<PathBuf>,
+    /// Optional per-session base image (rootfs) path. When set, a dedicated
+    /// sandbox is created using this rootfs instead of the pool's default.
+    /// The sandbox is destroyed when the session is closed (not returned to pool).
+    pub base_image: Option<PathBuf>,
 }
 
 impl SessionOptions {
     /// Set the session working directory.
     pub fn working_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.working_dir = Some(path.into());
+        self
+    }
+
+    /// Set a custom base image (rootfs) for this session.
+    /// The session will get a dedicated sandbox with this rootfs,
+    /// which is destroyed (not pooled) when the session closes.
+    pub fn base_image(mut self, path: impl Into<PathBuf>) -> Self {
+        self.base_image = Some(path.into());
         self
     }
 }
@@ -27,6 +39,9 @@ pub(super) struct SessionHandle {
     pub(super) sandbox_id: String,
     pub(super) working_dir: PathBuf,
     pub(super) execution_lock: Arc<AsyncMutex<()>>,
+    /// When true, the sandbox was created with a per-session rootfs and
+    /// must be destroyed (not returned to the idle pool) on session close.
+    pub(super) custom_rootfs: bool,
 }
 
 fn normalize_session_working_dir(path: &Path) -> PathBuf {
@@ -59,7 +74,14 @@ impl Pool {
             return Err(PoolError::ShuttingDown);
         }
 
-        let sandbox = self.acquire_sandbox().await?;
+        let (sandbox, custom_rootfs) = if let Some(ref base_image) = options.base_image {
+            let sandbox = self.create_sandbox_with_rootfs(base_image).await?;
+            (sandbox, true)
+        } else {
+            let sandbox = self.acquire_sandbox().await?;
+            (sandbox, false)
+        };
+
         let working_dir = normalize_session_working_dir(
             options
                 .working_dir
@@ -74,6 +96,7 @@ impl Pool {
                 sandbox_id: sandbox.id().to_string(),
                 working_dir: working_dir.clone(),
                 execution_lock: Arc::new(AsyncMutex::new(())),
+                custom_rootfs,
             },
         );
 
@@ -81,6 +104,7 @@ impl Pool {
             session_id = %session_id,
             sandbox_id = %sandbox.id(),
             working_dir = %working_dir.display(),
+            custom_rootfs = custom_rootfs,
             "session created"
         );
         Ok(session_id)
@@ -156,28 +180,39 @@ impl Pool {
             })?
         };
 
-        match sandbox.reset().await {
-            Ok(()) => {
-                self.return_to_idle(&session.sandbox_id);
-                tracing::info!(
-                    session_id = %session_id,
-                    sandbox_id = %session.sandbox_id,
-                    "session closed"
-                );
-                Ok(())
-            }
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    session_id = %session_id,
-                    sandbox_id = %session.sandbox_id,
-                    "session sandbox reset failed; replacing"
-                );
-                self.sandboxes.write().remove(&session.sandbox_id);
-                drop(sandbox);
+        if session.custom_rootfs {
+            // Custom rootfs sandboxes are destroyed, not returned to pool
+            self.remove_sandbox(&session.sandbox_id);
+            tracing::info!(
+                session_id = %session_id,
+                sandbox_id = %session.sandbox_id,
+                "session closed (custom rootfs sandbox destroyed)"
+            );
+            Ok(())
+        } else {
+            match sandbox.reset().await {
+                Ok(()) => {
+                    self.return_to_idle(&session.sandbox_id);
+                    tracing::info!(
+                        session_id = %session_id,
+                        sandbox_id = %session.sandbox_id,
+                        "session closed"
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        session_id = %session_id,
+                        sandbox_id = %session.sandbox_id,
+                        "session sandbox reset failed; replacing"
+                    );
+                    self.sandboxes.write().remove(&session.sandbox_id);
+                    drop(sandbox);
 
-                self.replace_sandbox(&session.sandbox_id).await?;
-                Ok(())
+                    self.replace_sandbox(&session.sandbox_id).await?;
+                    Ok(())
+                }
             }
         }
     }

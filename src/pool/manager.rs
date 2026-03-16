@@ -7,6 +7,7 @@
 //! pool back toward `min_sandboxes`.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -168,6 +169,37 @@ impl Pool {
             .map_err(|e| PoolError::InitFailed(e.to_string()))?;
 
         Ok(Arc::new(sandbox))
+    }
+
+    /// Create a sandbox with a custom rootfs (for per-session base images).
+    /// The sandbox is tracked in the pool but NOT added to the idle queue.
+    pub(super) async fn create_sandbox_with_rootfs(
+        &self,
+        base_image: &Path,
+    ) -> Result<Arc<Sandbox>, PoolError> {
+        let idx = self.next_sandbox_id.fetch_add(1, Ordering::Relaxed);
+        let sandbox_id = format!("sandbox-custom-{idx}");
+
+        tracing::debug!("Creating custom-rootfs sandbox: {sandbox_id} with base_image={}", base_image.display());
+
+        let mut sandbox = Sandbox::new(sandbox_id.clone(), &self.config)
+            .map_err(|e| PoolError::InitFailed(e.to_string()))?;
+
+        if let Some(ref monitor) = self.process_monitor {
+            sandbox.set_process_monitor(monitor.clone());
+        }
+
+        sandbox
+            .initialize(base_image, &self.config.overlay_driver)
+            .await
+            .map_err(|e| PoolError::InitFailed(e.to_string()))?;
+
+        let sandbox = Arc::new(sandbox);
+        self.sandboxes
+            .write()
+            .insert(sandbox_id, sandbox.clone());
+
+        Ok(sandbox)
     }
 
     pub(super) fn store_idle_sandbox(&self, sandbox: Arc<Sandbox>, idle_since: Instant) {
