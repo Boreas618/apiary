@@ -1,0 +1,8 @@
+[project]
+name = "apiary-swebench"
+version = "0.1.0"
+description = "SWE-bench environment library for Apiary sandboxes"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28",
+]
