@@ -1,9 +1,13 @@
 """HTTP client for the Apiary sandbox pool REST API."""
 
+import json
+import logging
 import time
 from dataclasses import dataclass
 
 import requests
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -32,6 +36,37 @@ class ApiaryClient:
         if token:
             self._http.headers["Authorization"] = f"Bearer {token}"
 
+    @staticmethod
+    def _raise_for_status(
+        resp: requests.Response,
+        *,
+        context: str = "",
+        payload: dict | None = None,
+    ) -> None:
+        if resp.ok:
+            return
+        try:
+            body = resp.text
+        except Exception:
+            body = "<unreadable>"
+        LOGGER.error(
+            "HTTP %d %s\n"
+            "  Context:  %s\n"
+            "  Request:  %s %s\n"
+            "  Payload:  %s\n"
+            "  Response: %s\n"
+            "  Headers:  %s",
+            resp.status_code,
+            resp.reason,
+            context or "n/a",
+            resp.request.method,
+            resp.request.url,
+            json.dumps(payload, default=str)[:2000] if payload else "n/a",
+            body[:4000],
+            dict(resp.headers),
+        )
+        resp.raise_for_status()
+
     # ------------------------------------------------------------------
     # Health / status
     # ------------------------------------------------------------------
@@ -52,7 +87,7 @@ class ApiaryClient:
     def status(self) -> dict:
         """Return the current pool status dict."""
         resp = self._http.get(f"{self.url}/api/v1/status", timeout=10)
-        resp.raise_for_status()
+        self._raise_for_status(resp, context="pool status")
         return resp.json()
 
     # ------------------------------------------------------------------
@@ -75,7 +110,7 @@ class ApiaryClient:
             json=payload or None,
             timeout=120,
         )
-        resp.raise_for_status()
+        self._raise_for_status(resp, context="create_session", payload=payload)
         return resp.json()["session_id"]
 
     def close_session(self, session_id: str) -> None:
@@ -84,7 +119,7 @@ class ApiaryClient:
             f"{self.url}/api/v1/sessions/{session_id}",
             timeout=60,
         )
-        resp.raise_for_status()
+        self._raise_for_status(resp, context=f"close_session {session_id}")
 
     # ------------------------------------------------------------------
     # Task execution
@@ -116,7 +151,11 @@ class ApiaryClient:
             json=payload,
             timeout=http_timeout,
         )
-        resp.raise_for_status()
+        self._raise_for_status(
+            resp,
+            context=f"execute task session={session_id}",
+            payload=payload,
+        )
         data = resp.json()
         return TaskResult(
             task_id=data["task_id"],

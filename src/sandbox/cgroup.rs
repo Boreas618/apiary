@@ -46,17 +46,33 @@ pub fn setup_cgroup(sandbox_id: &str, limits: &ResourceLimits) -> Result<PathBuf
 }
 
 fn get_cgroup_path(sandbox_id: &str) -> Result<PathBuf, SandboxError> {
-    if let Ok(delegated) = find_delegated_cgroup() {
-        return Ok(delegated.join("apiary").join(sandbox_id));
+    if let Ok(base) = find_cgroup_base() {
+        return Ok(base.join(sandbox_id));
     }
     Ok(PathBuf::from(CGROUP_V2_BASE)
         .join("apiary")
         .join(sandbox_id))
 }
 
-fn find_delegated_cgroup() -> Result<PathBuf, SandboxError> {
-    // Use the real uid (before user namespace), since cgroup paths
-    // on the host are named after the original uid, not the mapped one.
+fn find_cgroup_base() -> Result<PathBuf, SandboxError> {
+    // Highest priority: explicit env var from entrypoint/run script.
+    // In Docker with "cgroup: private", the daemon process is moved to a
+    // leaf cgroup (/daemon) to satisfy the no-internal-process rule, so
+    // /proc/self/cgroup returns /daemon — not where sandbox cgroups should
+    // go. APIARY_CGROUP_BASE points to the pre-configured /apiary/ subtree.
+    if let Ok(base) = std::env::var("APIARY_CGROUP_BASE") {
+        let path = PathBuf::from(&base);
+        if path.exists() && is_cgroup_writable(&path) {
+            tracing::info!(path = %path.display(), "using cgroup base from APIARY_CGROUP_BASE");
+            return Ok(path);
+        }
+        tracing::warn!(
+            path = %path.display(),
+            "APIARY_CGROUP_BASE is set but path is not writable; falling back to auto-detection"
+        );
+    }
+
+    // Try user-slice delegation (rootless systemd)
     let uid = super::namespace::original_uid();
     let patterns = [
         format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"),
@@ -66,14 +82,15 @@ fn find_delegated_cgroup() -> Result<PathBuf, SandboxError> {
     for pattern in &patterns {
         let path = PathBuf::from(pattern);
         if path.exists() && is_cgroup_writable(&path) {
-            return Ok(path);
+            return Ok(path.join("apiary"));
         }
     }
 
+    // Fall back to current process's cgroup
     if let Ok(cgroup_path) = read_current_cgroup() {
         let full_path = PathBuf::from(CGROUP_V2_BASE).join(cgroup_path.trim_start_matches('/'));
         if full_path.exists() && is_cgroup_writable(&full_path) {
-            return Ok(full_path);
+            return Ok(full_path.join("apiary"));
         }
     }
 
@@ -127,10 +144,21 @@ fn apply_limits(cgroup_path: &Path, limits: &ResourceLimits) -> Result<(), Sandb
         }
     }
 
-    if !available.contains("memory") || !available.contains("pids") {
+    let required = ["memory", "pids", "cpu"];
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|c| !available.contains(*c))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        let available_trimmed = available.trim();
         tracing::warn!(
-            available = %available.trim(),
-            "some cgroup controllers not available; resource limits may be incomplete"
+            missing = ?missing,
+            available = if available_trimmed.is_empty() { "(none)" } else { available_trimmed },
+            cgroup_path = %cgroup_path.display(),
+            "cgroup controllers missing — resource limits will not be enforced for: {missing:?}. \
+             Ensure the parent cgroup has delegated these controllers \
+             (echo '+memory +pids +cpu' > /sys/fs/cgroup/<parent>/cgroup.subtree_control)"
         );
     }
 
@@ -264,7 +292,7 @@ pub fn is_cgroup_v2_available() -> bool {
 
 /// Check if the current user has a delegated cgroup.
 pub fn has_delegated_cgroup() -> bool {
-    find_delegated_cgroup().is_ok()
+    find_cgroup_base().is_ok()
 }
 
 /// Parse a memory size string to bytes.

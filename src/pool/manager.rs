@@ -127,6 +127,21 @@ impl Pool {
     async fn initialize_sandboxes(&self) -> Result<(), PoolError> {
         tracing::info!("Initializing {} sandboxes...", self.config.min_sandboxes);
 
+        let rootfs_cache = self.config.overlay_dir.join(".rootfs-cache");
+        if rootfs_cache.exists() {
+            tracing::info!(
+                path = %rootfs_cache.display(),
+                "removing stale rootfs cache from previous run"
+            );
+            if let Err(e) = std::fs::remove_dir_all(&rootfs_cache) {
+                tracing::warn!(
+                    path = %rootfs_cache.display(),
+                    error = %e,
+                    "failed to remove rootfs cache; will attempt to overwrite"
+                );
+            }
+        }
+
         let now = Instant::now();
         for _ in 0..self.config.min_sandboxes {
             let sandbox = self.create_sandbox().await?;

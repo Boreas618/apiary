@@ -29,6 +29,7 @@ import asyncio
 import base64
 import contextvars
 import hmac
+import json
 import logging
 import os
 import shlex
@@ -118,19 +119,56 @@ class SessionManager:
             self._locks[cid] = asyncio.Lock()
         return self._locks[cid]
 
-    async def _create_apiary_session(self) -> str:
-        client = await self._get_client()
-        resp = await client.post(
-            "/api/v1/sessions",
-            json={"working_dir": self._working_dir},
+    @staticmethod
+    def _raise_for_status(resp: httpx.Response, *, context: str = "", payload: dict | None = None) -> None:
+        if resp.is_success:
+            return
+        try:
+            body = resp.text
+        except Exception:
+            body = "<unreadable>"
+        LOGGER.error(
+            "HTTP %d %s %s\n"
+            "  Context:  %s\n"
+            "  Request:  %s %s\n"
+            "  Payload:  %s\n"
+            "  Response: %s\n"
+            "  Headers:  %s",
+            resp.status_code,
+            resp.reason_phrase,
+            resp.url,
+            context or "n/a",
+            resp.request.method,
+            resp.request.url,
+            json.dumps(payload, default=str)[:2000] if payload else "n/a",
+            body[:4000],
+            dict(resp.headers),
         )
         resp.raise_for_status()
+
+    async def _create_apiary_session(self) -> str:
+        client = await self._get_client()
+        payload = {"working_dir": self._working_dir}
+        resp = await client.post("/api/v1/sessions", json=payload)
+        self._raise_for_status(resp, context="create_apiary_session", payload=payload)
         return resp.json()["session_id"]
 
     async def _destroy_apiary_session(self, session_id: str) -> None:
         try:
             client = await self._get_client()
-            await client.delete(f"/api/v1/sessions/{session_id}")
+            resp = await client.delete(f"/api/v1/sessions/{session_id}")
+            if not resp.is_success:
+                try:
+                    body = resp.text
+                except Exception:
+                    body = "<unreadable>"
+                LOGGER.warning(
+                    "Failed to destroy apiary session %s: HTTP %d %s — %s",
+                    session_id,
+                    resp.status_code,
+                    resp.reason_phrase,
+                    body[:2000],
+                )
         except Exception:
             LOGGER.warning(
                 "Failed to destroy apiary session %s",
@@ -208,7 +246,7 @@ class SessionManager:
     ) -> dict:
         """Run *command* in the caller's sandbox."""
         cid = _client_id.get()
-        wrapped = f"bash -c {shlex.quote(command)}"
+        wrapped = f"/bin/sh -c {shlex.quote(command)}"
         session_id = await self._ensure_session(cid)
         client = await self._get_client()
 
@@ -235,7 +273,11 @@ class SessionManager:
             payload["session_id"] = session_id
             resp = await client.post("/api/v1/tasks", json=payload)
 
-        resp.raise_for_status()
+        self._raise_for_status(
+            resp,
+            context=f"execute task for client={cid} session={session_id}",
+            payload=payload,
+        )
         return resp.json()
 
     async def shutdown(self) -> None:
@@ -306,7 +348,7 @@ async def shell_exec(
     client_id is used.
 
     Args:
-        command: Shell command (interpreted by bash; pipes, redirects, etc. work).
+        command: Shell command (interpreted by /bin/sh; pipes, redirects, etc. work).
         timeout_ms: Maximum execution time in milliseconds (default 30 000).
         working_dir: Override the working directory for this command.
     """

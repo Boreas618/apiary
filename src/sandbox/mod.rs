@@ -280,6 +280,64 @@ impl Sandbox {
         let need_stdout_pipe = task.capture_stdout;
         let need_stderr_pipe = task.capture_stderr;
 
+        tracing::debug!(
+            sandbox_id = %self.id,
+            task_id = %task.id,
+            shell = %shell,
+            args = ?args,
+            root = %root.display(),
+            workdir = %workdir.display(),
+            has_cgroup = cgroup_path.is_some(),
+            seccomp_policy = ?seccomp_policy,
+            uid = ?task_uid,
+            gid = ?task_gid,
+            writable_mounts = writable_mounts.len(),
+            readonly_mounts = readonly_mounts.len(),
+            timeout_secs = task_timeout.as_secs(),
+            "spawning sandbox process"
+        );
+
+        // Parent-side stat check: verify the overlay is still functional right
+        // before we fork. If this fails, the overlay broke AFTER initialization.
+        let probe_path = self.root_path.join("bin/sh");
+        match std::fs::metadata(&probe_path) {
+            Ok(meta) => {
+                use std::os::unix::fs::MetadataExt;
+                tracing::debug!(
+                    sandbox_id = %self.id,
+                    path = %probe_path.display(),
+                    mode = format_args!("{:#o}", meta.mode()),
+                    size = meta.len(),
+                    "parent-side overlay probe: OK"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    sandbox_id = %self.id,
+                    path = %probe_path.display(),
+                    error = %e,
+                    raw_errno = ?e.raw_os_error(),
+                    "parent-side overlay probe: FAILED — overlay is broken BEFORE fork"
+                );
+                log_mount_diagnostics(&self.root_path);
+            }
+        }
+
+        // Dup the parent's stderr fd so the child can write pre_exec
+        // breadcrumbs (step-by-step progress, stat probes, exec target
+        // diagnostics) directly to the terminal log, bypassing the captured
+        // pipe. Only enabled when APIARY_DEBUG is set — in normal operation
+        // pre_exec is silent and errors are reported via the spawn() return.
+        let debug_fd = if std::env::var_os("APIARY_DEBUG").is_some() {
+            let fd = unsafe { libc::dup(libc::STDERR_FILENO) };
+            if fd < 0 {
+                tracing::warn!("APIARY_DEBUG set but failed to dup stderr for pre_exec debug output");
+            }
+            fd
+        } else {
+            -1
+        };
+
         let mut cmd = Command::new(&shell);
         cmd.args(&args)
             .env(
@@ -303,9 +361,10 @@ impl Sandbox {
             cmd.stdin(std::process::Stdio::piped());
         }
 
+        let shell_for_preexec = shell.clone();
         unsafe {
             cmd.pre_exec(move || {
-                configure_task_process_linux(
+                let result = configure_task_process_linux(
                     &root,
                     &workdir,
                     cgroup_path.as_deref(),
@@ -316,13 +375,65 @@ impl Sandbox {
                     task_gid,
                     &writable_mounts,
                     &readonly_mounts,
-                )
+                    debug_fd,
+                    &shell_for_preexec,
+                );
+                if debug_fd >= 0 {
+                    libc::close(debug_fd);
+                }
+                result
             });
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| SandboxError::SpawnFailed(format!("failed to spawn process: {e}")))?;
+        let spawn_result = cmd.spawn();
+
+        // Close the parent's copy of debug_fd (child got its own copy via fork)
+        if debug_fd >= 0 {
+            unsafe { libc::close(debug_fd) };
+        }
+
+        let mut child = spawn_result.map_err(|e| {
+            let raw_errno = e.raw_os_error();
+            let error_msg = e.to_string();
+            let has_step_prefix = error_msg.contains("step ");
+
+            tracing::error!(
+                sandbox_id = %self.id,
+                task_id = %task.id,
+                error = %e,
+                raw_errno = ?raw_errno,
+                error_kind = ?e.kind(),
+                shell = %shell,
+                root = %self.root_path.display(),
+                has_step_prefix,
+                "sandbox process spawn failed"
+            );
+
+            if has_step_prefix {
+                tracing::error!(
+                    sandbox_id = %self.id,
+                    "pre_exec failed at the step indicated above"
+                );
+            } else {
+                tracing::error!(
+                    sandbox_id = %self.id,
+                    shell = %shell,
+                    "spawn failure has no step prefix from pre_exec. Two possibilities:\n\
+                     (A) fork/clone itself failed (pre_exec never ran):\n\
+                         - Container seccomp blocks clone/clone3\n\
+                         - PID/namespace limit reached\n\
+                     (B) pre_exec succeeded but execvp(\"{shell}\") failed:\n\
+                         - The binary does not exist inside the sandbox rootfs\n\
+                         - The overlayfs does not support exec after pivot_root (EOPNOTSUPP)\n\
+                         - The binary requires a missing shared library (ENOENT)\n\
+                     Set APIARY_DEBUG=1 to enable detailed pre_exec breadcrumbs on stderr.\n\
+                     If breadcrumbs show 'configuration complete', the issue is (B)."
+                );
+                log_spawn_diagnostics();
+            }
+
+            SandboxError::SpawnFailed(format!("failed to spawn process: {e}"))
+        })?;
         let child_pid = child.id();
         if let Some(pid) = child_pid {
             *self.init_pid.lock() = Some(nix::unistd::Pid::from_raw(pid as i32));
@@ -530,5 +641,188 @@ where
 {
     if let Err(error) = result {
         tracing::debug!(%error, action, "best-effort sandbox cleanup failed");
+    }
+}
+
+/// Collect and log mount/filesystem diagnostics when the overlay probe fails.
+fn log_mount_diagnostics(root_path: &Path) {
+    // Check if the mount point directory exists
+    match std::fs::metadata(root_path) {
+        Ok(meta) => {
+            use std::os::unix::fs::MetadataExt;
+            tracing::error!(
+                path = %root_path.display(),
+                mode = format_args!("{:#o}", meta.mode()),
+                ino = meta.ino(),
+                dev = format_args!("{:#x}", meta.dev()),
+                "mount diagnostics: root_path stat OK (directory exists)"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                path = %root_path.display(),
+                error = %e,
+                "mount diagnostics: root_path stat FAILED (mount point gone?)"
+            );
+        }
+    }
+
+    // List directory contents (readdir might work even if stat on files fails)
+    match std::fs::read_dir(root_path) {
+        Ok(entries) => {
+            let names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .take(20)
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            tracing::error!(
+                entries = ?names,
+                "mount diagnostics: readdir OK"
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "mount diagnostics: readdir FAILED");
+        }
+    }
+
+    // Check /proc/self/mountinfo for relevant mounts
+    if let Ok(mounts) = std::fs::read_to_string("/proc/self/mountinfo") {
+        let root_str = root_path.to_string_lossy();
+        // Also check the parent (overlay base dir)
+        let parent_str = root_path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let relevant: Vec<&str> = mounts
+            .lines()
+            .filter(|l| l.contains(root_str.as_ref()) || l.contains(&parent_str))
+            .collect();
+        if relevant.is_empty() {
+            tracing::error!(
+                path = %root_path.display(),
+                "mount diagnostics: NO mount found for this path in /proc/self/mountinfo!"
+            );
+        } else {
+            for line in &relevant {
+                tracing::error!(mount_entry = %line, "mount diagnostics: mountinfo");
+            }
+        }
+    }
+
+    // Check if fuse-overlayfs processes are running
+    if let Ok(output) = std::process::Command::new("pgrep")
+        .args(["-a", "fuse-overlayfs"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() {
+            tracing::error!(
+                "mount diagnostics: NO fuse-overlayfs processes running! Daemon likely crashed."
+            );
+        } else {
+            for line in stdout.trim().lines() {
+                tracing::error!(process = %line, "mount diagnostics: fuse-overlayfs process");
+            }
+        }
+    }
+
+    // statfs on the mount point to check filesystem type
+    let c_path =
+        std::ffi::CString::new(root_path.to_string_lossy().as_bytes()).ok();
+    if let Some(ref c_path) = c_path {
+        let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::statfs(c_path.as_ptr(), &mut buf) };
+        if ret == 0 {
+            let fs_name = match buf.f_type {
+                0x61756673 => "aufs",
+                0xEF53 => "ext2/ext3/ext4",
+                0x794c7630 => "overlayfs",
+                0x01021994 => "tmpfs",
+                0x9123683e => "btrfs",
+                0x58465342 => "xfs",
+                0x65735546 => "fuse",
+                0x6969 => "nfs",
+                0xBD00BD0 => "lustre",
+                _ => "unknown",
+            };
+            tracing::error!(
+                f_type = format_args!("{:#x}", buf.f_type),
+                fs_name,
+                "mount diagnostics: statfs on root_path"
+            );
+        } else {
+            let err = std::io::Error::last_os_error();
+            tracing::error!(error = %err, "mount diagnostics: statfs FAILED");
+        }
+    }
+}
+
+/// Collect and log system diagnostic info to help debug spawn failures.
+fn log_spawn_diagnostics() {
+    let uid = nix::unistd::Uid::current();
+    let euid = nix::unistd::Uid::effective();
+    let pid = std::process::id();
+
+    tracing::error!(
+        uid = uid.as_raw(),
+        euid = euid.as_raw(),
+        pid,
+        "spawn diagnostics: process identity"
+    );
+
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        let interesting: Vec<&str> = status
+            .lines()
+            .filter(|l| {
+                l.starts_with("NStgid:")
+                    || l.starts_with("NSpid:")
+                    || l.starts_with("NSpgid:")
+                    || l.starts_with("NSsid:")
+                    || l.starts_with("CapEff:")
+                    || l.starts_with("CapPrm:")
+                    || l.starts_with("CapBnd:")
+                    || l.starts_with("Seccomp:")
+                    || l.starts_with("NoNewPrivs:")
+                    || l.starts_with("Threads:")
+            })
+            .collect();
+        tracing::error!(
+            proc_status = ?interesting,
+            "spawn diagnostics: /proc/self/status (namespace/capability/seccomp fields)"
+        );
+    }
+
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
+        tracing::error!(
+            cgroup = %cgroup.trim(),
+            "spawn diagnostics: /proc/self/cgroup"
+        );
+    }
+
+    if let Ok(kernel) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+        tracing::error!(kernel = %kernel.trim(), "spawn diagnostics: kernel version");
+    }
+
+    if let Ok(userns_clone) =
+        std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+    {
+        tracing::error!(
+            value = %userns_clone.trim(),
+            "spawn diagnostics: unprivileged_userns_clone"
+        );
+    }
+
+    if let Ok(max_user_ns) = std::fs::read_to_string("/proc/sys/user/max_user_namespaces") {
+        tracing::error!(
+            value = %max_user_ns.trim(),
+            "spawn diagnostics: max_user_namespaces"
+        );
+    }
+
+    if let Ok(max_mnt_ns) = std::fs::read_to_string("/proc/sys/user/max_mnt_namespaces") {
+        tracing::error!(
+            value = %max_mnt_ns.trim(),
+            "spawn diagnostics: max_mnt_namespaces"
+        );
     }
 }

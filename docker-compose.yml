@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
     security_opt:
       - seccomp=unconfined
+      - apparmor=unconfined
       - label=disable
     cap_add:
       - SYS_ADMIN

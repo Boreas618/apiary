@@ -56,6 +56,37 @@ pub fn setup_overlay(
         )));
     }
 
+    // Pre-flight: verify the underlying layers are on functional filesystems
+    // before attempting any overlay mount. This catches EOPNOTSUPP from
+    // Lustre, NFS, or other filesystems that lack xattr/overlay support.
+    diagnose_layer_health("lower", lower);
+    diagnose_layer_health("upper", upper);
+
+    // If the lower layer lacks xattr support, overlayfs will silently break.
+    // Copy the rootfs to a tmpfs-backed cache that has full xattr support.
+    //
+    // NFS xattr support depends on protocol version:
+    //   - NFSv3: no xattr support at all
+    //   - NFSv4.0/4.1: limited (depends on server implementation and mount options)
+    //   - NFSv4.2: full xattr support
+    // Lustre also lacks user.* xattr support in common configurations.
+    let effective_lower;
+    let _tmpfs_guard; // keeps the tmpfs alive if we mounted one
+    if !check_xattr_support(lower) {
+        let cache_dir = work
+            .parent()
+            .unwrap_or(work)
+            .parent()
+            .unwrap_or(work)
+            .join(".rootfs-cache");
+        effective_lower = ensure_xattr_lower(lower, &cache_dir)?;
+        _tmpfs_guard = Some(cache_dir);
+    } else {
+        effective_lower = lower.to_path_buf();
+        _tmpfs_guard = None;
+    }
+    let lower = effective_lower.as_path();
+
     let rootless = namespace::is_rootless_mode();
 
     match driver {
@@ -82,6 +113,12 @@ pub fn setup_overlay(
                              - Run as root (not recommended)"
                     ))
                 })?;
+                validate_overlay_mount(merged).map_err(|e| {
+                    let _ = unmount_fuse_overlay(merged);
+                    SandboxError::OverlaySetup(format!(
+                        "fuse-overlayfs mounted but validation failed: {e}"
+                    ))
+                })?;
                 tracing::info!("Using fuse-overlayfs (kernel overlay unavailable)");
                 Ok(ActiveOverlay::FuseOverlayfs)
             }
@@ -93,6 +130,7 @@ pub fn setup_overlay(
         }
         OverlayDriver::FuseOverlayfs => {
             try_fuse_overlayfs(merged, upper, work, lower)?;
+            validate_overlay_mount(merged)?;
             tracing::info!("Using fuse-overlayfs (forced)");
             Ok(ActiveOverlay::FuseOverlayfs)
         }
@@ -104,30 +142,446 @@ fn try_kernel_overlay(
     upper: &Path,
     work: &Path,
     lower: &Path,
-    rootless: bool,
+    _rootless: bool,
 ) -> Result<(), SandboxError> {
-    let mut options = format!(
+    let base_options = format!(
         "lowerdir={},upperdir={},workdir={}",
         lower.display(),
         upper.display(),
         work.display()
     );
 
-    // In user namespaces (rootless), xattrs must be stored in the
-    // user.* namespace instead of trusted.*, which requires the
-    // userxattr mount option (Linux 5.11+).
-    if rootless {
-        options.push_str(",userxattr");
-    }
-
-    mount(
+    // Always try with userxattr first. It stores overlay metadata in user.*
+    // instead of trusted.*, which is required when:
+    //   - rootless mode (user namespaces cannot access trusted.* xattrs)
+    //   - nested overlayfs (Docker overlay2 — trusted.* not supported by overlayfs)
+    //   - filesystems that don't support trusted.* xattrs (Lustre, NFSv3,
+    //     NFSv4.0/4.1 with limited xattr support, etc.)
+    // On kernel 5.11+ (required anyway for rootless overlayfs) this is always safe.
+    let options_with_userxattr = format!("{base_options},userxattr");
+    let mount_result = mount(
         Some("overlay"),
         merged,
         Some("overlay"),
         MsFlags::empty(),
-        Some(options.as_str()),
-    )
-    .map_err(|e| SandboxError::OverlaySetup(format!("kernel overlay mount failed: {e}")))
+        Some(options_with_userxattr.as_str()),
+    );
+
+    match mount_result {
+        Ok(()) => {
+            if let Err(e) = validate_overlay_mount(merged) {
+                tracing::warn!(%e, "overlay+userxattr mounted but validation failed; unmounting");
+                let _ = umount2(merged, MntFlags::MNT_DETACH);
+            } else {
+                tracing::info!("kernel overlayfs mounted with userxattr");
+                return Ok(());
+            }
+        }
+        Err(e) => {
+            tracing::info!(
+                error = %e,
+                "kernel overlayfs mount with userxattr failed; trying without"
+            );
+        }
+    }
+
+    // Fallback: try without userxattr (for older kernels or other edge cases)
+    let fallback_result = mount(
+        Some("overlay"),
+        merged,
+        Some("overlay"),
+        MsFlags::empty(),
+        Some(base_options.as_str()),
+    );
+
+    match fallback_result {
+        Ok(()) => {
+            if let Err(e) = validate_overlay_mount(merged) {
+                let _ = umount2(merged, MntFlags::MNT_DETACH);
+                return Err(SandboxError::OverlaySetup(format!(
+                    "kernel overlay mount failed validation both with and without userxattr. \
+                     Last error: {e}\n\
+                     The underlying filesystem does not support the xattrs overlayfs needs. \
+                     Set overlay_driver = \"fuse_overlayfs\" in the config, or install \
+                     fuse-overlayfs (apt install fuse-overlayfs)."
+                )));
+            }
+            tracing::info!("kernel overlayfs mounted without userxattr");
+            Ok(())
+        }
+        Err(e) => Err(SandboxError::OverlaySetup(format!(
+            "kernel overlay mount failed: {e}"
+        ))),
+    }
+}
+
+fn validate_overlay_mount(merged: &Path) -> Result<(), SandboxError> {
+    // Call metadata() directly on known paths — do NOT use exists() because it
+    // silently returns false when stat() returns EOPNOTSUPP, hiding the real error.
+    let test_targets = ["bin/sh", "usr/bin/env", "etc/passwd"];
+    for relpath in &test_targets {
+        let full = merged.join(relpath);
+        match std::fs::metadata(&full) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT)
+                || e.raw_os_error() == Some(libc::ENOTDIR) =>
+            {
+                continue;
+            }
+            Err(e) => {
+                return Err(SandboxError::OverlaySetup(format!(
+                    "overlay mount at {} appears broken — stat({}) failed: {e} (errno {:?}). \
+                     The underlying filesystem likely does not support the xattrs overlayfs needs. \
+                     Set overlay_driver = \"fuse_overlayfs\" in the config.",
+                    merged.display(),
+                    full.display(),
+                    e.raw_os_error(),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check if a path's filesystem supports user.* xattrs.
+fn check_xattr_support(path: &Path) -> bool {
+    let test_path = if path.is_dir() {
+        // Try a known file inside the directory first
+        let candidates = ["bin/sh", "usr/bin/env", "etc/passwd"];
+        candidates
+            .iter()
+            .map(|r| path.join(r))
+            .find(|p| {
+                // Use metadata() not exists() — exists() hides EOPNOTSUPP
+                std::fs::metadata(p).is_ok()
+            })
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+
+    let c_path = match std::ffi::CString::new(test_path.to_string_lossy().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return true, // assume OK if path is weird
+    };
+
+    let ret = unsafe {
+        libc::getxattr(
+            c_path.as_ptr(),
+            b"user.overlay.test\0".as_ptr() as *const libc::c_char,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EOPNOTSUPP) => {
+                tracing::info!(
+                    path = %test_path.display(),
+                    "filesystem does not support xattrs"
+                );
+                return false;
+            }
+            // ENODATA means "attribute not found" — xattrs ARE supported
+            _ => return true,
+        }
+    }
+    true
+}
+
+/// Copy the rootfs to a directory with xattr support when the original
+/// filesystem doesn't support them (NFSv3, NFSv4.0/4.1 with limited xattr,
+/// Lustre, etc.). NFSv4.2 fully supports xattrs but is not yet common.
+///
+/// Strategy (in order of preference):
+///   1. Reuse existing cache (with marker file)
+///   2. Copy to `cache_dir` on the overlay volume — uses disk, not RAM
+///   3. Mount tmpfs at `cache_dir` and copy — uses RAM, always works
+fn ensure_xattr_lower(lower: &Path, cache_dir: &Path) -> Result<std::path::PathBuf, SandboxError> {
+    let marker = cache_dir.join(".apiary-rootfs-cached");
+
+    // Reuse existing cache
+    if marker.exists() && check_xattr_support(cache_dir) {
+        tracing::info!(cache = %cache_dir.display(), "reusing rootfs cache (xattr OK)");
+        return Ok(cache_dir.to_path_buf());
+    }
+
+    tracing::info!(
+        lower = %lower.display(),
+        "lower layer on NFS/Lustre without xattr support; creating local rootfs cache"
+    );
+
+    std::fs::create_dir_all(cache_dir).map_err(|e| {
+        SandboxError::OverlaySetup(format!(
+            "failed to create rootfs cache dir {}: {e}",
+            cache_dir.display()
+        ))
+    })?;
+
+    // Strategy 1: try using the directory as-is (Docker volume is often ext4/xfs)
+    let need_tmpfs = !check_xattr_support_on_dir(cache_dir);
+
+    if need_tmpfs {
+        // Strategy 2: mount tmpfs over the cache dir
+        tracing::info!(
+            "overlay volume also lacks xattr support; mounting tmpfs at {}",
+            cache_dir.display()
+        );
+        mount(
+            Some("tmpfs"),
+            cache_dir,
+            Some("tmpfs"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            Some("size=4g"),
+        )
+        .map_err(|e| {
+            SandboxError::OverlaySetup(format!(
+                "failed to mount tmpfs at {} for rootfs cache: {e}. \
+                 As a workaround, copy the rootfs to a local filesystem with xattr support \
+                 and pass that path with --base-image.",
+                cache_dir.display()
+            ))
+        })?;
+        tracing::info!("rootfs cache will use tmpfs (RAM-backed)");
+    } else {
+        tracing::info!(
+            "rootfs cache will use overlay volume at {} (disk-backed)",
+            cache_dir.display()
+        );
+    }
+
+    copy_rootfs(lower, cache_dir)?;
+
+    // Write marker so subsequent sandboxes reuse the cache
+    let _ = std::fs::write(&marker, if need_tmpfs { "tmpfs" } else { "disk" });
+
+    let cache_size = std::process::Command::new("du")
+        .args(["-sh", &cache_dir.to_string_lossy()])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    tracing::info!(
+        cache = %cache_dir.display(),
+        size = %cache_size,
+        backing = if need_tmpfs { "tmpfs (RAM)" } else { "disk" },
+        "rootfs cached successfully"
+    );
+
+    Ok(cache_dir.to_path_buf())
+}
+
+/// Test xattr support on a directory by writing and removing a test xattr.
+fn check_xattr_support_on_dir(dir: &Path) -> bool {
+    let test_file = dir.join(".apiary-xattr-test");
+    if std::fs::write(&test_file, b"test").is_err() {
+        return false;
+    }
+    let result = check_xattr_support(&test_file);
+    let _ = std::fs::remove_file(&test_file);
+    result
+}
+
+fn copy_rootfs(src: &Path, dst: &Path) -> Result<(), SandboxError> {
+    // Use rsync if available (handles partial failures gracefully),
+    // fall back to cp -a which may fail on NFS root_squash files.
+    let (program, args) = if which_exists("rsync") {
+        ("rsync", vec!["-a", "--ignore-errors", "--quiet"])
+    } else {
+        ("cp", vec!["-a", "--force"])
+    };
+
+    let output = std::process::Command::new(program)
+        .args(&args)
+        .arg(format!("{}/.", src.display()))
+        .arg(dst)
+        .output()
+        .map_err(|e| {
+            SandboxError::OverlaySetup(format!("failed to run {program} for rootfs cache: {e}"))
+        })?;
+
+    // cp/rsync may return non-zero due to NFS root_squash preventing reads on
+    // files like /etc/shadow, /root, lock files etc. These are non-essential
+    // for sandbox operation. Accept the copy if key files are present.
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(
+            program,
+            exit_code = ?output.status.code(),
+            "rootfs copy had errors (likely NFS root_squash on restricted files). \
+             Verifying essential files were copied."
+        );
+        if !stderr.is_empty() {
+            for line in stderr.lines().take(5) {
+                tracing::warn!("  {line}");
+            }
+            let total_errors = stderr.lines().count();
+            if total_errors > 5 {
+                tracing::warn!("  ... and {} more errors", total_errors - 5);
+            }
+        }
+    }
+
+    // Verify essential files exist in the cache
+    let essential = ["bin/sh", "usr", "lib"];
+    let mut found = 0;
+    for name in &essential {
+        let p = dst.join(name);
+        if std::fs::metadata(&p).is_ok() {
+            found += 1;
+        }
+    }
+    if found == 0 {
+        return Err(SandboxError::OverlaySetup(format!(
+            "rootfs copy to {} failed — no essential files (bin/sh, usr, lib) found. \
+             Check permissions on the source rootfs at {}.",
+            dst.display(),
+            src.display(),
+        )));
+    }
+
+    if !check_xattr_support(dst) {
+        return Err(SandboxError::OverlaySetup(
+            "rootfs cache still lacks xattr support after copy (unexpected)".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn which_exists(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Log the health of an overlay layer's underlying filesystem.
+fn diagnose_layer_health(label: &str, path: &Path) {
+    // stat the directory itself
+    match std::fs::metadata(path) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(
+                layer = label,
+                path = %path.display(),
+                error = %e,
+                raw_errno = ?e.raw_os_error(),
+                "overlay layer directory stat FAILED"
+            );
+            return;
+        }
+    }
+
+    // stat a known file inside the layer
+    let test_files = ["bin/sh", "usr/bin/env", "etc/passwd"];
+    for relpath in &test_files {
+        let full = path.join(relpath);
+        match std::fs::metadata(&full) {
+            Ok(meta) => {
+                use std::os::unix::fs::MetadataExt;
+                tracing::trace!(
+                    layer = label,
+                    path = %full.display(),
+                    mode = format_args!("{:#o}", meta.mode()),
+                    size = meta.len(),
+                    dev = format_args!("{:#x}", meta.dev()),
+                    "overlay {label} layer: direct stat OK"
+                );
+
+                // check statfs to identify filesystem type
+                let c_path = std::ffi::CString::new(
+                    full.to_string_lossy().as_bytes(),
+                )
+                .ok();
+                if let Some(ref c_path) = c_path {
+                    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+                    if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } == 0 {
+                        let fs_name = match buf.f_type {
+                            0xEF53 => "ext2/ext3/ext4",
+                            0x794c7630 => "overlayfs",
+                            0x01021994 => "tmpfs",
+                            0x9123683e => "btrfs",
+                            0x58465342 => "xfs",
+                            0x65735546 => "fuse",
+                            0x6969 => "nfs",
+                            0x0BD00BD0 => "lustre",
+                            _ => "unknown",
+                        };
+                        tracing::trace!(
+                            layer = label,
+                            f_type = format_args!("{:#x}", buf.f_type),
+                            fs_name,
+                            "overlay {label} layer filesystem"
+                        );
+                    }
+                }
+
+                // check xattr support
+                let c_full = std::ffi::CString::new(
+                    full.to_string_lossy().as_bytes(),
+                )
+                .ok();
+                if let Some(ref c_full) = c_full {
+                    let mut xattr_buf = [0u8; 256];
+                    let ret = unsafe {
+                        libc::getxattr(
+                            c_full.as_ptr(),
+                            b"user.overlay.opaque\0".as_ptr() as *const libc::c_char,
+                            xattr_buf.as_mut_ptr() as *mut libc::c_void,
+                            xattr_buf.len(),
+                        )
+                    };
+                    if ret < 0 {
+                        let err = std::io::Error::last_os_error();
+                        tracing::trace!(
+                            layer = label,
+                            error = %err,
+                            raw_errno = ?err.raw_os_error(),
+                            "overlay {label} layer: getxattr(user.overlay.opaque) result \
+                             (ENODATA=normal, EOPNOTSUPP=no xattr support)"
+                        );
+                    } else {
+                        tracing::trace!(
+                            layer = label,
+                            "overlay {label} layer: getxattr(user.overlay.opaque) OK"
+                        );
+                    }
+                }
+
+                return;
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+            Err(e) => {
+                tracing::error!(
+                    layer = label,
+                    path = %full.display(),
+                    error = %e,
+                    raw_errno = ?e.raw_os_error(),
+                    "overlay {label} layer: direct stat on file FAILED (filesystem broken?)"
+                );
+                return;
+            }
+        }
+    }
+    // upper layers are expected to be empty initially — don't warn for them
+    if label == "upper" {
+        tracing::trace!(
+            layer = label,
+            path = %path.display(),
+            "overlay {label} layer: empty (expected for fresh upper)"
+        );
+    } else {
+        tracing::warn!(
+            layer = label,
+            path = %path.display(),
+            "overlay {label} layer: no known test files found"
+        );
+    }
 }
 
 fn try_fuse_overlayfs(
