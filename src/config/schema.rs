@@ -60,6 +60,11 @@ pub struct PoolConfig {
     /// Default environment variables for all tasks.
     #[serde(default)]
     pub default_env: HashMap<String, String>,
+
+    /// Dump per-session execution history to CWD on close.
+    /// Runtime-only flag (set via `--dump-history` CLI flag, not the config file).
+    #[serde(skip)]
+    pub dump_history: bool,
 }
 
 fn default_min_sandboxes() -> usize {
@@ -106,6 +111,7 @@ impl Default for PoolConfig {
             default_timeout: default_timeout(),
             default_workdir: default_workdir(),
             default_env: HashMap::new(),
+            dump_history: false,
         }
     }
 }
@@ -360,6 +366,7 @@ impl PoolConfigBuilder {
             default_timeout: self.default_timeout.unwrap_or_else(default_timeout),
             default_workdir: self.default_workdir.unwrap_or_else(default_workdir),
             default_env: self.default_env.unwrap_or_default(),
+            dump_history: false,
         };
         config.validate()?;
         Ok(config)
@@ -452,6 +459,7 @@ rlimit_as_multiplier = 4
         );
         assert_eq!(config.resource_limits.rlimit_as_multiplier, 4);
     }
+
 }
 
 pub fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>

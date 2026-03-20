@@ -97,9 +97,16 @@ class ApiaryClient:
     def create_session(
         self,
         working_dir: str | None = None,
-        base_image: str | None = None,
+        base_image: list[str] | None = None,
     ) -> str:
-        """Create a persistent session.  Returns the ``session_id``."""
+        """Create a persistent session.  Returns the ``session_id``.
+
+        Parameters
+        ----------
+        base_image:
+            Ordered list of layer directory paths (base first, topmost
+            last) to use as the OverlayFS lower dirs for this session.
+        """
         payload: dict = {}
         if working_dir:
             payload["working_dir"] = working_dir

@@ -7,7 +7,7 @@
 //! pool back toward `min_sandboxes`.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -127,18 +127,25 @@ impl Pool {
     async fn initialize_sandboxes(&self) -> Result<(), PoolError> {
         tracing::info!("Initializing {} sandboxes...", self.config.min_sandboxes);
 
-        let rootfs_cache = self.config.overlay_dir.join(".rootfs-cache");
-        if rootfs_cache.exists() {
-            tracing::info!(
-                path = %rootfs_cache.display(),
-                "removing stale rootfs cache from previous run"
-            );
-            if let Err(e) = std::fs::remove_dir_all(&rootfs_cache) {
-                tracing::warn!(
-                    path = %rootfs_cache.display(),
-                    error = %e,
-                    "failed to remove rootfs cache; will attempt to overwrite"
-                );
+        // Remove stale xattr rootfs caches from a previous run.
+        // The per-layer fallback creates .rootfs-cache-{N} directories.
+        if let Ok(entries) = std::fs::read_dir(&self.config.overlay_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with(".rootfs-cache") {
+                    tracing::info!(
+                        path = %entry.path().display(),
+                        "removing stale rootfs cache from previous run"
+                    );
+                    if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                        tracing::warn!(
+                            path = %entry.path().display(),
+                            error = %e,
+                            "failed to remove rootfs cache; will attempt to overwrite"
+                        );
+                    }
+                }
             }
         }
 
@@ -178,24 +185,29 @@ impl Pool {
             sandbox.set_process_monitor(monitor.clone());
         }
 
+        let default_layers = [self.config.base_image.clone()];
         sandbox
-            .initialize(&self.config.base_image, &self.config.overlay_driver)
+            .initialize(&default_layers, &self.config.overlay_driver)
             .await
             .map_err(|e| PoolError::InitFailed(e.to_string()))?;
 
         Ok(Arc::new(sandbox))
     }
 
-    /// Create a sandbox with a custom rootfs (for per-session base images).
+    /// Create a sandbox with custom layer directories (for per-session
+    /// base images).  `lower_dirs` lists layers bottom-to-top (base first).
     /// The sandbox is tracked in the pool but NOT added to the idle queue.
-    pub(super) async fn create_sandbox_with_rootfs(
+    pub(super) async fn create_sandbox_with_layers(
         &self,
-        base_image: &Path,
+        lower_dirs: &[PathBuf],
     ) -> Result<Arc<Sandbox>, PoolError> {
         let idx = self.next_sandbox_id.fetch_add(1, Ordering::Relaxed);
         let sandbox_id = format!("sandbox-custom-{idx}");
 
-        tracing::debug!("Creating custom-rootfs sandbox: {sandbox_id} with base_image={}", base_image.display());
+        tracing::debug!(
+            "Creating custom-layers sandbox: {sandbox_id} with {} lower dir(s)",
+            lower_dirs.len()
+        );
 
         let mut sandbox = Sandbox::new(sandbox_id.clone(), &self.config)
             .map_err(|e| PoolError::InitFailed(e.to_string()))?;
@@ -205,7 +217,7 @@ impl Pool {
         }
 
         sandbox
-            .initialize(base_image, &self.config.overlay_driver)
+            .initialize(lower_dirs, &self.config.overlay_driver)
             .await
             .map_err(|e| PoolError::InitFailed(e.to_string()))?;
 

@@ -56,6 +56,7 @@ pub(super) fn append_capped(target: &mut Vec<u8>, chunk: &[u8], max_output_size:
 #[cfg(test)]
 mod tests {
     use super::{append_capped, read_output_stream};
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn read_output_stream_truncates_to_requested_size() {

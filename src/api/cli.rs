@@ -73,6 +73,10 @@ enum Commands {
         /// Bearer token for API authentication (also reads APIARY_API_TOKEN env)
         #[arg(long, env = "APIARY_API_TOKEN")]
         api_token: Option<String>,
+
+        /// Dump per-session execution history to CWD on session close
+        #[arg(long)]
+        dump_history: bool,
     },
 
     /// Run a single command in a sandbox
@@ -92,6 +96,10 @@ enum Commands {
         /// Environment variables (KEY=VALUE)
         #[arg(long, short = 'e')]
         env: Vec<String>,
+
+        /// Dump execution history to CWD on session close
+        #[arg(long)]
+        dump_history: bool,
     },
 
     /// Run multiple tasks from a JSON file
@@ -103,6 +111,10 @@ enum Commands {
         /// Maximum parallel tasks
         #[arg(long, default_value = "10")]
         parallelism: usize,
+
+        /// Dump per-session execution history to CWD on session close
+        #[arg(long)]
+        dump_history: bool,
     },
 
     /// Show pool configuration and status
@@ -164,19 +176,28 @@ async fn async_main() -> anyhow::Result<()> {
             )
             .await?;
         }
-        Commands::Daemon { bind, api_token } => {
-            run_daemon(bind, api_token, config_path).await?;
+        Commands::Daemon {
+            bind,
+            api_token,
+            dump_history,
+        } => {
+            run_daemon(bind, api_token, dump_history, config_path).await?;
         }
         Commands::Run {
             command,
             timeout,
             workdir,
             env,
+            dump_history,
         } => {
-            run_task(command, timeout, workdir, env, config_path).await?;
+            run_task(command, timeout, workdir, env, dump_history, config_path).await?;
         }
-        Commands::Batch { tasks, parallelism } => {
-            run_batch(tasks, parallelism, config_path).await?;
+        Commands::Batch {
+            tasks,
+            parallelism,
+            dump_history,
+        } => {
+            run_batch(tasks, parallelism, dump_history, config_path).await?;
         }
         Commands::Status => {
             show_status(config_path).await?;
@@ -271,9 +292,11 @@ pub async fn init_pool(
 pub async fn run_daemon(
     bind: String,
     api_token: Option<String>,
+    dump_history: bool,
     config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let (config, _) = load_config(config_path)?;
+    let (mut config, _) = load_config(config_path)?;
+    config.dump_history = dump_history;
 
     let pool = Pool::new(config).await?;
     tracing::info!("Pool initialized with {} sandboxes", pool.status().total);
@@ -293,9 +316,11 @@ pub async fn run_task(
     timeout: u64,
     workdir: Option<PathBuf>,
     env: Vec<String>,
+    dump_history: bool,
     config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let (config, _) = load_config(config_path)?;
+    let (mut config, _) = load_config(config_path)?;
+    config.dump_history = dump_history;
     let pool = Pool::new(config).await?;
 
     let env_map: HashMap<String, String> = env
@@ -357,6 +382,7 @@ pub async fn run_task(
 pub async fn run_batch(
     tasks_file: PathBuf,
     parallelism: usize,
+    dump_history: bool,
     config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     if parallelism == 0 {
@@ -366,7 +392,8 @@ pub async fn run_batch(
         anyhow::bail!("Tasks file not found: {}", tasks_file.display());
     }
 
-    let (config, _) = load_config(config_path)?;
+    let (mut config, _) = load_config(config_path)?;
+    config.dump_history = dump_history;
     let capped_min = parallelism.min(config.min_sandboxes);
     let capped_max = parallelism.min(config.max_sandboxes);
     let config = config.with_pool_bounds(capped_min, capped_max)?;

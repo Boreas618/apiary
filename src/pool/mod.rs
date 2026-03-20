@@ -1,5 +1,6 @@
 //! Sandbox pool management.
 
+mod history;
 mod manager;
 mod scaling;
 mod session;

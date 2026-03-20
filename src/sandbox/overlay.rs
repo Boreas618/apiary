@@ -2,10 +2,17 @@
 //!
 //! This module provides functions to setup and manage OverlayFS mounts
 //! for sandbox isolation. Each sandbox has:
-//! - A shared read-only lower layer (base image)
+//! - One or more shared read-only lower layers (base image layers)
 //! - A private upper layer for writable files
 //! - A work directory for OverlayFS internals
 //! - A merged view that the sandbox sees
+//!
+//! ## Multi-lowerdir
+//!
+//! OverlayFS supports stacking multiple read-only lower directories via
+//! `lowerdir=top:...:base`. This module accepts lower dirs in
+//! **bottom-to-top order** (base first) to match Docker convention, and
+//! reverses them when formatting the mount option.
 //!
 //! ## Overlay Drivers
 //!
@@ -20,7 +27,7 @@
 //!   reliably in rootless mode on virtually all distributions. Requires
 //!   `fuse-overlayfs` to be installed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 
@@ -38,98 +45,125 @@ pub enum ActiveOverlay {
 
 /// Setup an OverlayFS mount using the configured driver strategy.
 ///
+/// `lower_dirs` lists layer directories in **bottom-to-top** order (base
+/// first, topmost last) — matching Docker convention.  The function
+/// reverses the order when formatting the OverlayFS `lowerdir=` mount
+/// option, which expects top-to-bottom.
+///
 /// Returns the [`ActiveOverlay`] variant that was successfully used,
 /// so callers can pass it to [`unmount_overlay`] later.
 pub fn setup_overlay(
     merged: &Path,
     upper: &Path,
     work: &Path,
-    lower: &Path,
+    lower_dirs: &[PathBuf],
     driver: &OverlayDriver,
 ) -> Result<ActiveOverlay, SandboxError> {
     create_overlay_dirs(upper, work, merged)?;
 
-    if !lower.exists() {
-        return Err(SandboxError::OverlaySetup(format!(
-            "lower layer does not exist: {}",
-            lower.display()
-        )));
+    if lower_dirs.is_empty() {
+        return Err(SandboxError::OverlaySetup(
+            "no lower directories provided".to_string(),
+        ));
     }
 
-    // Pre-flight: verify the underlying layers are on functional filesystems
-    // before attempting any overlay mount. This catches EOPNOTSUPP from
-    // Lustre, NFS, or other filesystems that lack xattr/overlay support.
-    diagnose_layer_health("lower", lower);
+    for (i, lower) in lower_dirs.iter().enumerate() {
+        if !lower.exists() {
+            return Err(SandboxError::OverlaySetup(format!(
+                "lower layer {} does not exist: {}",
+                i,
+                lower.display()
+            )));
+        }
+    }
+
+    // Pre-flight diagnostics on all lower layers and the upper layer.
+    for (i, lower) in lower_dirs.iter().enumerate() {
+        diagnose_layer_health(&format!("lower[{i}]"), lower);
+    }
     diagnose_layer_health("upper", upper);
 
-    // If the lower layer lacks xattr support, overlayfs will silently break.
-    // Copy the rootfs to a tmpfs-backed cache that has full xattr support.
-    //
-    // NFS xattr support depends on protocol version:
-    //   - NFSv3: no xattr support at all
-    //   - NFSv4.0/4.1: limited (depends on server implementation and mount options)
-    //   - NFSv4.2: full xattr support
-    // Lustre also lacks user.* xattr support in common configurations.
-    let effective_lower;
-    let _tmpfs_guard; // keeps the tmpfs alive if we mounted one
-    if !check_xattr_support(lower) {
-        let cache_dir = work
-            .parent()
-            .unwrap_or(work)
-            .parent()
-            .unwrap_or(work)
-            .join(".rootfs-cache");
-        effective_lower = ensure_xattr_lower(lower, &cache_dir)?;
-        _tmpfs_guard = Some(cache_dir);
-    } else {
-        effective_lower = lower.to_path_buf();
-        _tmpfs_guard = None;
+    // Ensure every lower layer is on a filesystem with xattr support.
+    // Layers that lack it are copied to a per-layer cache directory.
+    let overlay_base = work
+        .parent()
+        .unwrap_or(work)
+        .parent()
+        .unwrap_or(work);
+
+    let mut effective_lowers: Vec<PathBuf> = Vec::with_capacity(lower_dirs.len());
+    let mut _tmpfs_guards: Vec<PathBuf> = Vec::new();
+
+    for (i, lower) in lower_dirs.iter().enumerate() {
+        if !check_xattr_support(lower) {
+            let cache_dir = overlay_base.join(format!(".rootfs-cache-{i}"));
+            let cached = ensure_xattr_lower(lower, &cache_dir)?;
+            _tmpfs_guards.push(cache_dir);
+            effective_lowers.push(cached);
+        } else {
+            effective_lowers.push(lower.clone());
+        }
     }
-    let lower = effective_lower.as_path();
+
+    // OverlayFS lowerdir: topmost (highest priority) first, base last.
+    let lowerdir_str = effective_lowers
+        .iter()
+        .rev()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+
+    tracing::debug!(
+        num_layers = lower_dirs.len(),
+        lowerdir = %lowerdir_str,
+        "formatted multi-lowerdir mount option"
+    );
 
     let rootless = namespace::is_rootless_mode();
 
     match driver {
-        OverlayDriver::Auto => match try_kernel_overlay(merged, upper, work, lower, rootless) {
-            Ok(()) => {
-                tracing::info!("Using kernel overlayfs");
-                Ok(ActiveOverlay::KernelOverlay)
+        OverlayDriver::Auto => {
+            match try_kernel_overlay(merged, upper, work, &lowerdir_str, rootless) {
+                Ok(()) => {
+                    tracing::info!("Using kernel overlayfs");
+                    Ok(ActiveOverlay::KernelOverlay)
+                }
+                Err(kernel_err) => {
+                    tracing::debug!(
+                        %kernel_err,
+                        "Kernel overlay mount failed; trying fuse-overlayfs"
+                    );
+                    try_fuse_overlayfs(merged, upper, work, &lowerdir_str).map_err(|fuse_err| {
+                        SandboxError::OverlaySetup(format!(
+                            "All overlay drivers failed.\n\
+                                 Kernel overlay: {kernel_err}\n\
+                                 fuse-overlayfs: {fuse_err}\n\n\
+                                 Possible fixes:\n\
+                                 - Install fuse-overlayfs: apt install fuse-overlayfs (Debian/Ubuntu) \
+                                   or dnf install fuse-overlayfs (Fedora/RHEL)\n\
+                                 - Use a kernel >= 5.11 with unprivileged overlay support\n\
+                                 - Check AppArmor/SELinux policies that may block overlay mounts\n\
+                                 - Run as root (not recommended)"
+                        ))
+                    })?;
+                    validate_overlay_mount(merged).map_err(|e| {
+                        let _ = unmount_fuse_overlay(merged);
+                        SandboxError::OverlaySetup(format!(
+                            "fuse-overlayfs mounted but validation failed: {e}"
+                        ))
+                    })?;
+                    tracing::info!("Using fuse-overlayfs (kernel overlay unavailable)");
+                    Ok(ActiveOverlay::FuseOverlayfs)
+                }
             }
-            Err(kernel_err) => {
-                tracing::debug!(
-                    %kernel_err,
-                    "Kernel overlay mount failed; trying fuse-overlayfs"
-                );
-                try_fuse_overlayfs(merged, upper, work, lower).map_err(|fuse_err| {
-                    SandboxError::OverlaySetup(format!(
-                        "All overlay drivers failed.\n\
-                             Kernel overlay: {kernel_err}\n\
-                             fuse-overlayfs: {fuse_err}\n\n\
-                             Possible fixes:\n\
-                             - Install fuse-overlayfs: apt install fuse-overlayfs (Debian/Ubuntu) \
-                               or dnf install fuse-overlayfs (Fedora/RHEL)\n\
-                             - Use a kernel >= 5.11 with unprivileged overlay support\n\
-                             - Check AppArmor/SELinux policies that may block overlay mounts\n\
-                             - Run as root (not recommended)"
-                    ))
-                })?;
-                validate_overlay_mount(merged).map_err(|e| {
-                    let _ = unmount_fuse_overlay(merged);
-                    SandboxError::OverlaySetup(format!(
-                        "fuse-overlayfs mounted but validation failed: {e}"
-                    ))
-                })?;
-                tracing::info!("Using fuse-overlayfs (kernel overlay unavailable)");
-                Ok(ActiveOverlay::FuseOverlayfs)
-            }
-        },
+        }
         OverlayDriver::KernelOverlay => {
-            try_kernel_overlay(merged, upper, work, lower, rootless)?;
+            try_kernel_overlay(merged, upper, work, &lowerdir_str, rootless)?;
             tracing::info!("Using kernel overlayfs (forced)");
             Ok(ActiveOverlay::KernelOverlay)
         }
         OverlayDriver::FuseOverlayfs => {
-            try_fuse_overlayfs(merged, upper, work, lower)?;
+            try_fuse_overlayfs(merged, upper, work, &lowerdir_str)?;
             validate_overlay_mount(merged)?;
             tracing::info!("Using fuse-overlayfs (forced)");
             Ok(ActiveOverlay::FuseOverlayfs)
@@ -141,12 +175,11 @@ fn try_kernel_overlay(
     merged: &Path,
     upper: &Path,
     work: &Path,
-    lower: &Path,
+    lowerdir_str: &str,
     _rootless: bool,
 ) -> Result<(), SandboxError> {
     let base_options = format!(
-        "lowerdir={},upperdir={},workdir={}",
-        lower.display(),
+        "lowerdir={lowerdir_str},upperdir={},workdir={}",
         upper.display(),
         work.display()
     );
@@ -588,11 +621,10 @@ fn try_fuse_overlayfs(
     merged: &Path,
     upper: &Path,
     work: &Path,
-    lower: &Path,
+    lowerdir_str: &str,
 ) -> Result<(), SandboxError> {
     let options = format!(
-        "lowerdir={},upperdir={},workdir={}",
-        lower.display(),
+        "lowerdir={lowerdir_str},upperdir={},workdir={}",
         upper.display(),
         work.display()
     );

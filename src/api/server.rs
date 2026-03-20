@@ -38,8 +38,10 @@ struct ExecuteTaskRequest {
 struct CreateSessionRequest {
     #[serde(default)]
     working_dir: Option<PathBuf>,
+    /// Ordered list of layer directories (base first, topmost last) to use
+    /// as OverlayFS lower dirs for this session's sandbox.
     #[serde(default)]
-    base_image: Option<PathBuf>,
+    base_image: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -396,4 +398,5 @@ mod tests {
 
         assert!(error.to_string().contains("unknown field `timeout_secs`"));
     }
+
 }

@@ -160,25 +160,34 @@ impl Sandbox {
     }
 
     /// Initialize the sandbox.
+    ///
+    /// `lower_dirs` lists layer directories in bottom-to-top order (base
+    /// first, topmost last).  A single-element slice is the common case
+    /// for pool-default sandboxes backed by a flat rootfs.
     pub async fn initialize(
         &mut self,
-        base_image: &Path,
+        lower_dirs: &[PathBuf],
         driver: &OverlayDriver,
     ) -> Result<(), SandboxError> {
         self.set_state(SandboxState::Creating);
 
-        let base_image = base_image.canonicalize().map_err(|e| {
-            SandboxError::OverlaySetup(format!(
-                "base image not found at {}: {e}",
-                base_image.display()
-            ))
-        })?;
+        let canonical_lowers: Vec<PathBuf> = lower_dirs
+            .iter()
+            .map(|p| {
+                p.canonicalize().map_err(|e| {
+                    SandboxError::OverlaySetup(format!(
+                        "lower dir not found at {}: {e}",
+                        p.display()
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         let active = overlay::setup_overlay(
             &self.root_path,
             &self.upper_path,
             &self.work_path,
-            &base_image,
+            &canonical_lowers,
             driver,
         )?;
         *self.active_overlay.lock() = Some(active);

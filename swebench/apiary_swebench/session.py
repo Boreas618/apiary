@@ -60,18 +60,18 @@ class SWEBenchSession:
         self._working_dir = working_dir
 
         rootfs_mgr = RootfsManager(cache_dir=rootfs_cache_dir)
-        rootfs_path = rootfs_mgr.ensure(image)
+        layer_paths = rootfs_mgr.ensure_layers(image)
 
         self._client = ApiaryClient(url=apiary_url, token=apiary_token)
         self._session_id: str = self._client.create_session(
             working_dir=working_dir,
-            base_image=rootfs_path,
+            base_image=layer_paths,
         )
         logger.info(
-            "SWEBenchSession created: session=%s image=%s rootfs=%s",
+            "SWEBenchSession created: session=%s image=%s layers=%d",
             self._session_id,
             image,
-            rootfs_path,
+            len(layer_paths),
         )
 
     # ------------------------------------------------------------------
