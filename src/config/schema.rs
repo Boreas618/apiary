@@ -34,6 +34,12 @@ pub struct PoolConfig {
     /// Path to the base rootfs image (lower layer for OverlayFS).
     pub base_image: PathBuf,
 
+    /// When a session sends `base_image` layer paths that are relative (or only
+    /// a layer id), resolve them under this directory (SWE-bench cache layout:
+    /// `{parent}/.layers/{sha256-hex}/`).
+    #[serde(default = "default_rootfs_layers_dir")]
+    pub rootfs_layers_dir: PathBuf,
+
     /// Directory to store overlay layers.
     pub overlay_dir: PathBuf,
 
@@ -60,6 +66,14 @@ pub struct PoolConfig {
     /// Default environment variables for all tasks.
     #[serde(default)]
     pub default_env: HashMap<String, String>,
+
+    /// When true, every task gets a read-only bind mount of the daemon's
+    /// `/etc/resolv.conf` at `/etc/resolv.conf` inside the sandbox (before any
+    /// task-specific `readonly_mounts`). Skipped if the source file is missing
+    /// or the task already mounts `/etc/resolv.conf`. Use this so DNS matches
+    /// the apiary process environment (e.g. Docker `--dns` or `-v resolv.conf`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mount_host_resolv_conf: bool,
 
     /// Dump per-session execution history to CWD on close.
     /// Runtime-only flag (set via `--dump-history` CLI flag, not the config file).
@@ -95,6 +109,10 @@ fn default_workdir() -> PathBuf {
     PathBuf::from("/workspace")
 }
 
+fn default_rootfs_layers_dir() -> PathBuf {
+    PathBuf::from("/tmp/apiary_rootfs/.layers")
+}
+
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
@@ -104,6 +122,7 @@ impl Default for PoolConfig {
             idle_timeout: default_idle_timeout(),
             cooldown: default_cooldown(),
             base_image: PathBuf::from("./rootfs"),
+            rootfs_layers_dir: default_rootfs_layers_dir(),
             overlay_dir: PathBuf::from("./overlays"),
             overlay_driver: OverlayDriver::default(),
             resource_limits: ResourceLimits::default(),
@@ -111,6 +130,7 @@ impl Default for PoolConfig {
             default_timeout: default_timeout(),
             default_workdir: default_workdir(),
             default_env: HashMap::new(),
+            mount_host_resolv_conf: false,
             dump_history: false,
         }
     }
@@ -160,7 +180,8 @@ pub struct ResourceLimits {
 }
 
 fn default_memory_max() -> String {
-    "2G".to_string()
+    "4G".to_string()
+    // "2G".to_string()
 }
 
 fn default_cpu_max() -> String {
@@ -168,11 +189,12 @@ fn default_cpu_max() -> String {
 }
 
 fn default_pids_max() -> u64 {
-    256
+    2048
+    // 256
 }
 
 fn default_max_open_files() -> u64 {
-    1024
+    2048
 }
 
 fn default_rlimit_as_multiplier() -> u64 {
@@ -215,7 +237,8 @@ pub struct SeccompPolicy {
 }
 
 fn default_block_network() -> bool {
-    true
+    // true
+    false
 }
 
 fn default_allow_unix_sockets() -> bool {
@@ -270,6 +293,7 @@ pub struct PoolConfigBuilder {
     idle_timeout: Option<Duration>,
     cooldown: Option<Duration>,
     base_image: Option<PathBuf>,
+    rootfs_layers_dir: Option<PathBuf>,
     overlay_dir: Option<PathBuf>,
     overlay_driver: Option<OverlayDriver>,
     resource_limits: Option<ResourceLimits>,
@@ -277,6 +301,7 @@ pub struct PoolConfigBuilder {
     default_timeout: Option<Duration>,
     default_workdir: Option<PathBuf>,
     default_env: Option<HashMap<String, String>>,
+    mount_host_resolv_conf: Option<bool>,
 }
 
 impl PoolConfigBuilder {
@@ -307,6 +332,11 @@ impl PoolConfigBuilder {
 
     pub fn base_image<P: Into<PathBuf>>(mut self, path: P) -> Self {
         self.base_image = Some(path.into());
+        self
+    }
+
+    pub fn rootfs_layers_dir<P: Into<PathBuf>>(mut self, path: P) -> Self {
+        self.rootfs_layers_dir = Some(path.into());
         self
     }
 
@@ -347,6 +377,11 @@ impl PoolConfigBuilder {
         self
     }
 
+    pub fn mount_host_resolv_conf(mut self, enable: bool) -> Self {
+        self.mount_host_resolv_conf = Some(enable);
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<PoolConfig> {
         let config = PoolConfig {
             min_sandboxes: self.min_sandboxes.unwrap_or_else(default_min_sandboxes),
@@ -357,6 +392,9 @@ impl PoolConfigBuilder {
             base_image: self
                 .base_image
                 .ok_or_else(|| anyhow::anyhow!("base_image is required"))?,
+            rootfs_layers_dir: self
+                .rootfs_layers_dir
+                .unwrap_or_else(default_rootfs_layers_dir),
             overlay_dir: self
                 .overlay_dir
                 .unwrap_or_else(super::PoolConfig::default_overlay_dir),
@@ -366,6 +404,7 @@ impl PoolConfigBuilder {
             default_timeout: self.default_timeout.unwrap_or_else(default_timeout),
             default_workdir: self.default_workdir.unwrap_or_else(default_workdir),
             default_env: self.default_env.unwrap_or_default(),
+            mount_host_resolv_conf: self.mount_host_resolv_conf.unwrap_or(true), // by default, mount the host's resolv.conf
             dump_history: false,
         };
         config.validate()?;
@@ -376,6 +415,7 @@ impl PoolConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::{PoolConfig, ResourceLimits};
+    use std::path::PathBuf;
 
     #[test]
     fn unknown_top_level_field_is_rejected() {
@@ -458,6 +498,22 @@ rlimit_as_multiplier = 4
             Some("2G".to_string())
         );
         assert_eq!(config.resource_limits.rlimit_as_multiplier, 4);
+    }
+
+    #[test]
+    fn pool_config_defaults_rootfs_layers_dir() {
+        let config: PoolConfig = toml::from_str(
+            r#"
+base_image = "/tmp/rootfs"
+overlay_dir = "/tmp/overlays"
+"#,
+        )
+        .expect("pool config should parse");
+
+        assert_eq!(
+            config.rootfs_layers_dir,
+            PathBuf::from("/tmp/apiary_rootfs/.layers")
+        );
     }
 
 }

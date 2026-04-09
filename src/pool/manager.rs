@@ -187,7 +187,7 @@ impl Pool {
 
         let default_layers = [self.config.base_image.clone()];
         sandbox
-            .initialize(&default_layers, &self.config.overlay_driver)
+            .initialize(&default_layers, &self.config.overlay_driver, None)
             .await
             .map_err(|e| PoolError::InitFailed(e.to_string()))?;
 
@@ -217,7 +217,11 @@ impl Pool {
         }
 
         sandbox
-            .initialize(lower_dirs, &self.config.overlay_driver)
+            .initialize(
+                lower_dirs,
+                &self.config.overlay_driver,
+                Some(self.config.rootfs_layers_dir.as_path()),
+            )
             .await
             .map_err(|e| PoolError::InitFailed(e.to_string()))?;
 

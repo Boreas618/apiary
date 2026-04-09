@@ -22,5 +22,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/verify-sandbox.sh
 
 WORKDIR /workspace
 
+EXPOSE 8080
+
 ENTRYPOINT ["entrypoint.sh"]
 CMD ["bash"]

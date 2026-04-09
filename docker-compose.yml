@@ -7,8 +7,11 @@ services:
       - seccomp=unconfined
       - apparmor=unconfined
       - label=disable
+    ports:
+      - "8080:8080"
     cap_add:
       - SYS_ADMIN
+      - MKNOD
     devices:
       - /dev/fuse
     cgroup: private
@@ -21,6 +24,8 @@ services:
     volumes:
       - .:/workspace
       - apiary-overlays:/var/lib/apiary/overlays
+      - /etc/resolv.conf:/etc/resolv.conf:ro
+      - /var/run/docker.sock:/var/run/docker.sock
     working_dir: /workspace
 
 volumes:

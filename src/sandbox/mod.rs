@@ -96,6 +96,8 @@ pub struct Sandbox {
     active_overlay: Mutex<Option<ActiveOverlay>>,
     stats: SandboxStats,
     process_monitor: Option<ProcessMonitor>,
+    /// Bind-mount daemon `/etc/resolv.conf` into the sandbox for each task.
+    mount_host_resolv_conf: bool,
 }
 
 /// Statistics for a sandbox.
@@ -106,6 +108,59 @@ pub struct SandboxStats {
     pub successful_tasks: AtomicU64,
     pub failed_tasks: AtomicU64,
     pub timed_out_tasks: AtomicU64,
+}
+
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
+
+/// Prepend a read-only bind of the daemon's `resolv.conf` when enabled.
+fn merge_host_resolv_readonly_mounts(
+    mount_host_resolv: bool,
+    task_readonly: &[MountSpec],
+) -> Vec<MountSpec> {
+    if !mount_host_resolv {
+        return task_readonly.to_vec();
+    }
+    let source = Path::new(RESOLV_CONF_PATH);
+    if !source.is_file() {
+        tracing::debug!(
+            path = RESOLV_CONF_PATH,
+            "mount_host_resolv_conf: source missing; not adding resolv.conf mount"
+        );
+        return task_readonly.to_vec();
+    }
+    let dest = Path::new(RESOLV_CONF_PATH);
+    if task_readonly.iter().any(|m| m.dest.as_path() == dest) {
+        return task_readonly.to_vec();
+    }
+    let mut out = Vec::with_capacity(task_readonly.len() + 1);
+    out.push(MountSpec {
+        source: source.to_path_buf(),
+        dest: dest.to_path_buf(),
+    });
+    out.extend(task_readonly.iter().cloned());
+    out
+}
+
+/// Resolve one overlay lower directory for [`Sandbox::initialize`].
+///
+/// With `session_layers_base` (per-session `base_image`): `rootfs_layers_dir.join(path)`
+/// then canonicalize. If `path` is absolute, [`Path::join`] keeps that absolute path
+/// (same as passing a full lower dir). Without a base, require `path` to canonicalize as given.
+fn resolve_lower_dir(
+    p: &Path,
+    session_layers_base: Option<&Path>,
+) -> Result<PathBuf, SandboxError> {
+    let candidate = match session_layers_base {
+        Some(base) => base.join(p),
+        None => p.to_path_buf(),
+    };
+    candidate.canonicalize().map_err(|e| {
+        SandboxError::OverlaySetup(format!(
+            "lower dir not found at {} (resolved as {}): {e}",
+            p.display(),
+            candidate.display()
+        ))
+    })
 }
 
 impl Sandbox {
@@ -133,6 +188,7 @@ impl Sandbox {
             active_overlay: Mutex::new(None),
             stats: SandboxStats::default(),
             process_monitor: None,
+            mount_host_resolv_conf: config.mount_host_resolv_conf,
         })
     }
 
@@ -164,23 +220,21 @@ impl Sandbox {
     /// `lower_dirs` lists layer directories in bottom-to-top order (base
     /// first, topmost last).  A single-element slice is the common case
     /// for pool-default sandboxes backed by a flat rootfs.
+    ///
+    /// `session_layers_base`: when `Some`, each session `base_image` path is
+    /// `join`ed to this directory (typically `/tmp/apiary_rootfs/.layers`) and
+    /// then canonicalized.  Use `None` for the pool default rootfs path only.
     pub async fn initialize(
         &mut self,
         lower_dirs: &[PathBuf],
         driver: &OverlayDriver,
+        session_layers_base: Option<&Path>,
     ) -> Result<(), SandboxError> {
         self.set_state(SandboxState::Creating);
 
         let canonical_lowers: Vec<PathBuf> = lower_dirs
             .iter()
-            .map(|p| {
-                p.canonicalize().map_err(|e| {
-                    SandboxError::OverlaySetup(format!(
-                        "lower dir not found at {}: {e}",
-                        p.display()
-                    ))
-                })
-            })
+            .map(|p| resolve_lower_dir(p, session_layers_base))
             .collect::<Result<_, _>>()?;
 
         let active = overlay::setup_overlay(
@@ -284,7 +338,10 @@ impl Sandbox {
         let task_uid = task.uid;
         let task_gid = task.gid;
         let writable_mounts = task.writable_mounts.clone();
-        let readonly_mounts = task.readonly_mounts.clone();
+        let readonly_mounts = merge_host_resolv_readonly_mounts(
+            self.mount_host_resolv_conf,
+            &task.readonly_mounts,
+        );
 
         let need_stdout_pipe = task.capture_stdout;
         let need_stderr_pipe = task.capture_stderr;
@@ -833,5 +890,48 @@ fn log_spawn_diagnostics() {
             value = %max_mnt_ns.trim(),
             "spawn diagnostics: max_mnt_namespaces"
         );
+    }
+}
+
+#[cfg(test)]
+mod resolv_mount_tests {
+    use super::{merge_host_resolv_readonly_mounts, MountSpec};
+    use std::path::PathBuf;
+
+    #[test]
+    fn merge_disabled_leaves_task_mounts_unchanged() {
+        let task = vec![MountSpec {
+            source: PathBuf::from("/host/a"),
+            dest: PathBuf::from("/a"),
+        }];
+        let merged = merge_host_resolv_readonly_mounts(false, &task);
+        assert_eq!(merged, task);
+    }
+
+    #[test]
+    fn merge_skips_when_task_already_mounts_resolv() {
+        let task = vec![MountSpec {
+            source: PathBuf::from("/custom/resolv.conf"),
+            dest: PathBuf::from("/etc/resolv.conf"),
+        }];
+        let merged = merge_host_resolv_readonly_mounts(true, &task);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source, PathBuf::from("/custom/resolv.conf"));
+    }
+
+    #[test]
+    fn merge_prepends_resolv_when_enabled_and_source_exists() {
+        if !std::path::Path::new("/etc/resolv.conf").is_file() {
+            return;
+        }
+        let task = vec![MountSpec {
+            source: PathBuf::from("/host/extra"),
+            dest: PathBuf::from("/extra"),
+        }];
+        let merged = merge_host_resolv_readonly_mounts(true, &task);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].dest, PathBuf::from("/etc/resolv.conf"));
+        assert_eq!(merged[0].source, PathBuf::from("/etc/resolv.conf"));
+        assert_eq!(merged[1].dest, PathBuf::from("/extra"));
     }
 }

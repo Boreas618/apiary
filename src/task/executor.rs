@@ -76,7 +76,7 @@ fn default_max_output() -> usize {
 }
 
 /// A mount specification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountSpec {
     /// Source path on the host.
     pub source: PathBuf,
