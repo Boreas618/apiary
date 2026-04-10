@@ -4,6 +4,11 @@
 //! `apiary_swebench.rootfs.RootfsManager`), and write a JSON map
 //! `{image: [layer paths…]}` to `{rootfs_cache_dir}/.layers/image_layers_map.json`.
 //!
+//! **Batching:** `--batch-size N` and `--batch-id K` (0-based) restrict work to the *K*-th
+//! block of `N` unique images (sorted). Use `--batch-size 0` for the full set. With batching,
+//! existing `image_layers_map.json` is loaded and merged so runs can be split across machines
+//! or time without losing earlier entries.
+//!
 //! Requires: `docker` CLI, a writable cache directory (default `/tmp/apiary_rootfs`),
 //! and network access for HuggingFace unless `--dataset` is a local JSON/JSONL path.
 
@@ -15,6 +20,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::StatusCode;
@@ -320,7 +326,7 @@ impl RootfsManager {
         Ok(layers)
     }
 
-    fn ensure_layers(&self, image: &str) -> Result<Vec<PathBuf>> {
+    fn ensure_layers(&self, image: &str, batch_idx: usize, batch_total: usize) -> Result<Vec<PathBuf>> {
         let diff_ids = self.docker_inspect_layers(image)?;
         let missing: Vec<_> = diff_ids
             .iter()
@@ -329,14 +335,18 @@ impl RootfsManager {
             .collect();
         if !missing.is_empty() {
             info!(
-                "{}/{} layers missing for {} — docker save",
+                "[batch {batch_idx}/{batch_total}] {}/{} layers missing for {} — docker save",
                 missing.len(),
                 diff_ids.len(),
                 image
             );
-            self.extract_layers_from_save(image, &diff_ids)?;
+            self.extract_layers_from_save(image, &diff_ids, batch_idx, batch_total)?;
         } else {
-            info!("all {} layers cached for {}", diff_ids.len(), image);
+            info!(
+                "[batch {batch_idx}/{batch_total}] all {} layers cached for {}",
+                diff_ids.len(),
+                image
+            );
         }
         diff_ids
             .iter()
@@ -347,11 +357,22 @@ impl RootfsManager {
             .collect()
     }
 
-    fn extract_layers_from_save(&self, image: &str, diff_ids: &[String]) -> Result<()> {
+    fn extract_layers_from_save(
+        &self,
+        image: &str,
+        diff_ids: &[String],
+        batch_idx: usize,
+        batch_total: usize,
+    ) -> Result<()> {
         let archive_path = self
             .cache_dir
             .join(format!(".tmp-save-{}.tar", uuid::Uuid::new_v4()));
-        info!("docker save {} -> {}", image, archive_path.display());
+        let t_image = Instant::now();
+        info!(
+            "[batch {batch_idx}/{batch_total}] docker save {image} -> {}",
+            archive_path.display()
+        );
+        let t_save = Instant::now();
         let status = Command::new(&self.docker)
             .args(["save", "-o"])
             .arg(&archive_path)
@@ -362,6 +383,10 @@ impl RootfsManager {
             let _ = fs::remove_file(&archive_path);
             bail!("docker save failed for {image}");
         }
+        info!(
+            "[batch {batch_idx}/{batch_total}] docker save finished for {image} in {:?}",
+            t_save.elapsed()
+        );
 
         let result = (|| -> Result<()> {
             let layer_tar_paths = read_manifest_layer_paths(&archive_path)?;
@@ -374,6 +399,7 @@ impl RootfsManager {
                 );
             }
 
+            let t_extract = Instant::now();
             for (idx, layer_tar_path) in layer_tar_paths.iter().enumerate() {
                 let expected = &diff_ids[idx];
                 if self.layer_cached(expected)? {
@@ -392,6 +418,8 @@ impl RootfsManager {
                         expected,
                         idx + 1,
                         layer_tar_paths.len(),
+                        batch_idx,
+                        batch_total,
                     )?;
                     found = true;
                     break;
@@ -400,6 +428,11 @@ impl RootfsManager {
                     bail!("missing layer path {layer_tar_path} in docker save archive");
                 }
             }
+            info!(
+                "[batch {batch_idx}/{batch_total}] layer extract finished for {image} in {:?} (save+extract total {:?})",
+                t_extract.elapsed(),
+                t_image.elapsed()
+            );
             Ok(())
         })();
 
@@ -413,6 +446,8 @@ impl RootfsManager {
         expected_diff_id: &str,
         idx: usize,
         total: usize,
+        batch_idx: usize,
+        batch_total: usize,
     ) -> Result<()> {
         let tmp_layer = self
             .layers_dir
@@ -420,6 +455,7 @@ impl RootfsManager {
         let layer_dir = self.layer_path(expected_diff_id);
 
         let res = (|| -> Result<()> {
+            let t_layer = Instant::now();
             let mut hasher = Sha256::new();
             let mut tmp = File::create(&tmp_layer)?;
             let mut buf = [0u8; 65536];
@@ -444,7 +480,8 @@ impl RootfsManager {
             extract_layer_tar_with_whiteouts(&tmp_layer, &layer_dir)?;
 
             info!(
-                "extracted layer {idx}/{total}: {}…",
+                "[batch {batch_idx}/{batch_total}] extracted layer {idx}/{total} in {:?}: {}…",
+                t_layer.elapsed(),
                 &expected_diff_id[..expected_diff_id.len().min(24)]
             );
             Ok(())
@@ -623,6 +660,14 @@ struct Args {
     /// HuggingFace token (optional; also reads env HF_TOKEN)
     #[arg(long, env = "HF_TOKEN")]
     hf_token: Option<String>,
+
+    /// Process only one batch of this many **unique** images (sorted order). `0` = entire dataset.
+    #[arg(long, default_value_t = 0)]
+    batch_size: usize,
+
+    /// Which batch to run (0-based). Only used when `batch_size > 0`.
+    #[arg(long, default_value_t = 0)]
+    batch_id: usize,
 }
 
 async fn docker_pull(bin: &str, image: &str) -> Result<()> {
@@ -671,14 +716,45 @@ async fn main() -> Result<()> {
     for inst in &instances {
         images.insert(get_docker_image(inst)?);
     }
-    let images: Vec<String> = images.into_iter().collect();
+    let mut images: Vec<String> = images.into_iter().collect();
+    let total_unique = images.len();
+
+    if args.batch_size > 0 {
+        let start = args.batch_id.saturating_mul(args.batch_size);
+        if start >= images.len() {
+            let num_batches = (images.len() + args.batch_size - 1) / args.batch_size;
+            bail!(
+                "batch slice is empty: batch_id={} batch_size={} but only {} unique images \
+                 (use batch_id in 0..{} for non-empty batches)",
+                args.batch_id,
+                args.batch_size,
+                images.len(),
+                num_batches
+            );
+        }
+        let end = (start + args.batch_size).min(images.len());
+        images = images[start..end].to_vec();
+        info!(
+            "batch mode: batch_id={} batch_size={} → images [{}..{}) of {} unique",
+            args.batch_id,
+            args.batch_size,
+            start,
+            end,
+            total_unique
+        );
+    }
 
     info!(
-        "{} instances → {} unique images (dataset={} split={})",
+        "{} instances → {} unique images (dataset={} split={}){}",
         instances.len(),
-        images.len(),
+        total_unique,
         args.dataset,
-        args.split
+        args.split,
+        if args.batch_size > 0 {
+            format!("; this run processes {}", images.len())
+        } else {
+            String::new()
+        }
     );
 
     if let Some(ref p) = args.write_list {
@@ -725,24 +801,33 @@ async fn main() -> Result<()> {
 
     info!("[Phase 1] extracting image layers …");
     let mgr = RootfsManager::new(args.rootfs_cache_dir.clone(), args.docker.clone())?;
-    let mut rootfs_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for img in &images {
-        let paths = mgr.ensure_layers(img)?;
+    let manifest_path = mgr.layers_dir.join("image_layers_map.json");
+    let mut rootfs_map: BTreeMap<String, Vec<String>> = if manifest_path.exists() {
+        let text = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("read {}", manifest_path.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("parse {}", manifest_path.display()))?
+    } else {
+        BTreeMap::new()
+    };
+    let n_this_run = images.len();
+    let batch_total = n_this_run;
+    for (i, img) in images.iter().enumerate() {
+        let paths = mgr.ensure_layers(img, i + 1, batch_total)?;
         rootfs_map.insert(
             img.clone(),
             paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
         );
     }
 
-    let manifest_path = mgr.layers_dir.join("image_layers_map.json");
     fs::write(
         &manifest_path,
         serde_json::to_string_pretty(&rootfs_map).context("serialize manifest")?,
     )
     .with_context(|| format!("write {}", manifest_path.display()))?;
     info!(
-        "wrote {} image → layer paths under {}",
+        "wrote image_layers_map.json: {} image entries total ({} this run) under {}",
         rootfs_map.len(),
+        n_this_run,
         manifest_path.display()
     );
 
