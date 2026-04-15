@@ -508,6 +508,10 @@ pub async fn show_status(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     println!("Base image: {}", config.base_image.display());
     println!("Overlay dir: {}", config.overlay_dir.display());
     println!("Overlay driver: {:?}", config.overlay_driver);
+    println!(
+        "Mount host resolv.conf into sandbox: {}",
+        config.mount_host_resolv_conf
+    );
     println!("Default timeout: {:?}", config.default_timeout);
     println!("Default workdir: {}", config.default_workdir.display());
     println!("Seccomp: enabled");
