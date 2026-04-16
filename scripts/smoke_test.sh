@@ -6,6 +6,8 @@
 set -uo pipefail
 
 URL="${1:-http://127.0.0.1:8080}"
+IMAGE="${APIARY_IMAGE:-ubuntu:22.04}"
+WORKDIR="${APIARY_WORKDIR:-/workspace}"
 PASS=0
 FAIL=0
 TOTAL=0
@@ -47,14 +49,14 @@ exec_cmd() {
     local sid="$1" cmd="$2" tms="${3:-30000}"
     local payload
     if command -v jq >/dev/null 2>&1; then
-        payload=$(jq -n --arg c "$cmd" --arg s "$sid" --argjson t "$tms" \
-            '{command: $c, session_id: $s, timeout_ms: $t}')
+        payload=$(jq -n --arg c "$cmd" --argjson t "$tms" \
+            '{command: $c, timeout_ms: $t}')
     else
         local escaped_cmd
         escaped_cmd=$(printf '%s' "$cmd" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        payload="{\"command\":\"$escaped_cmd\",\"session_id\":\"$sid\",\"timeout_ms\":$tms}"
+        payload="{\"command\":\"$escaped_cmd\",\"timeout_ms\":$tms}"
     fi
-    api_post /api/v1/tasks "$payload"
+    api_post "/api/v1/sessions/${sid}/exec" "$payload"
 }
 
 # Wrap a shell command so redirects, pipes, $VAR etc. work via the REST API.
@@ -89,7 +91,7 @@ assert_json "has idle sandboxes"        "$STATUS" "assert d.get('idle',0) > 0, d
 
 # ── 3. Create session ──
 bold "--- Session ---"
-S_RESP=$(api_post /api/v1/sessions '{}' || echo '{}')
+S_RESP=$(api_post /api/v1/sessions "{\"image\":\"$IMAGE\",\"working_dir\":\"$WORKDIR\"}" || echo '{}')
 SID=$(echo "$S_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || true)
 
 TOTAL=$((TOTAL + 1))
@@ -168,7 +170,7 @@ else
 fi
 
 # New session — verify sandbox was reset
-S2_RESP=$(api_post /api/v1/sessions '{}' || echo '{}')
+S2_RESP=$(api_post /api/v1/sessions "{\"image\":\"$IMAGE\",\"working_dir\":\"$WORKDIR\"}" || echo '{}')
 SID2=$(echo "$S2_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || true)
 if [ -n "$SID2" ]; then
     R=$(exec_cmd "$SID2" "$(sh_cmd 'cat /workspace/.smoke-test 2>&1; echo done')")

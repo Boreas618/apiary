@@ -183,17 +183,21 @@ def build_mcp_workload(uid: str) -> list[tuple[str, dict]]:
 class ApiaryAgent:
     """Agent that communicates directly with the Apiary REST API."""
 
-    def __init__(self, agent_id: str, base_url: str, client: httpx.AsyncClient):
+    def __init__(
+        self, agent_id: str, base_url: str, client: httpx.AsyncClient,
+        *, image: str = "ubuntu:22.04",
+    ):
         self.agent_id = agent_id
         self.base_url = base_url.rstrip("/")
         self.client = client
+        self.image = image
         self.session_id: Optional[str] = None
 
     async def create_session(self) -> float:
         t0 = time.monotonic()
         resp = await self.client.post(
             f"{self.base_url}/api/v1/sessions",
-            json={"working_dir": "/workspace"},
+            json={"image": self.image, "working_dir": "/workspace"},
         )
         if resp.status_code >= 400:
             body = resp.text[:500]
@@ -207,10 +211,9 @@ class ApiaryAgent:
 
     async def execute(self, command: str, timeout_ms: int = 30_000) -> dict:
         resp = await self.client.post(
-            f"{self.base_url}/api/v1/tasks",
+            f"{self.base_url}/api/v1/sessions/{self.session_id}/exec",
             json={
                 "command": command,
-                "session_id": self.session_id,
                 "timeout_ms": timeout_ms,
             },
         )

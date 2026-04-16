@@ -1,0 +1,101 @@
+# syntax=docker/dockerfile:1
+#
+# SWE-bench deployment image.
+#
+# Self-contained multi-stage build: compiles the apiary binary, then produces
+# a runtime image with Python + apiary-client[swebench] for automatic image
+# resolution.  At container start the swebench-entrypoint resolves images,
+# runs `apiary init`, and starts the daemon.
+#
+# All behaviour is parameterised via environment variables — see ENV block
+# below and docker/swebench-entrypoint.sh for details.
+
+# ── Stage 1: Build ───────────────────────────────────────────────────────────
+
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > src/lib.rs \
+    && cargo build --release \
+    && rm -rf src
+
+COPY src/ src/
+RUN touch src/main.rs src/lib.rs && cargo build --release
+
+# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        uidmap \
+        fuse-overlayfs \
+        util-linux \
+        iproute2 \
+        python3 \
+        python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker CLI only — needed for `docker inspect` / layer extraction at init.
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && . /etc/os-release \
+    && ARCH="$(dpkg --print-architecture)" \
+    && { \
+        echo "Types: deb"; \
+        echo "URIs: https://download.docker.com/linux/debian"; \
+        echo "Suites: ${VERSION_CODENAME}"; \
+        echo "Components: stable"; \
+        echo "Architectures: ${ARCH}"; \
+        echo "Signed-By: /etc/apt/keyrings/docker.asc"; \
+    } > /etc/apt/sources.list.d/docker.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN echo "root:100000:65536" >> /etc/subuid \
+    && echo "root:100000:65536" >> /etc/subgid
+
+RUN test -x /usr/bin/newuidmap && test -x /usr/bin/newgidmap
+
+# ── Apiary binary ────────────────────────────────────────────────────────────
+
+COPY --from=builder /src/target/release/apiary /usr/local/bin/apiary
+
+# ── Python tooling (apiary-resolve-images) ───────────────────────────────────
+
+COPY bindings/python/ /opt/apiary-client/
+RUN pip3 install --break-system-packages /opt/apiary-client[swebench] \
+    && rm -rf /root/.cache/pip
+
+# ── Entrypoints ──────────────────────────────────────────────────────────────
+
+COPY docker/entrypoint.sh          /usr/local/bin/entrypoint.sh
+COPY docker/verify-sandbox.sh      /usr/local/bin/verify-sandbox.sh
+COPY docker/swebench-entrypoint.sh /usr/local/bin/swebench-entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh \
+             /usr/local/bin/verify-sandbox.sh \
+             /usr/local/bin/swebench-entrypoint.sh
+
+# ── Configuration defaults (override at runtime) ─────────────────────────────
+
+ENV SWEBENCH_DATASET=lite
+ENV SWEBENCH_SPLIT=test
+ENV SWEBENCH_BATCH_SIZE=0
+ENV SWEBENCH_BATCH_ID=0
+ENV APIARY_MAX_SANDBOXES=40
+ENV APIARY_BIND=0.0.0.0:8080
+ENV APIARY_IMAGE_LIST=
+ENV APIARY_API_TOKEN=
+ENV APIARY_LAYERS_DIR=/var/lib/apiary/layers
+
+EXPOSE 8080
+
+ENTRYPOINT ["entrypoint.sh"]
+CMD ["swebench-entrypoint.sh"]

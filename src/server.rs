@@ -30,24 +30,18 @@ struct ExecuteTaskRequest {
     working_dir: Option<PathBuf>,
     #[serde(default)]
     env: HashMap<String, String>,
-    session_id: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateSessionRequest {
-    #[serde(default)]
-    working_dir: Option<PathBuf>,
-    /// Ordered list of layer directories (base first, topmost last) to use
-    /// as OverlayFS lower dirs for this session's sandbox.
-    #[serde(default)]
-    base_image: Option<Vec<PathBuf>>,
+    working_dir: PathBuf,
+    image: String,
 }
 
 #[derive(Debug, Serialize)]
 struct ExecuteTaskResponse {
     task_id: String,
-    session_id: String,
     exit_code: i32,
     timed_out: bool,
     duration_ms: u128,
@@ -74,9 +68,9 @@ pub async fn run_server(bind: String, pool: Pool, api_token: Option<String>) -> 
 
     let api_routes = Router::new()
         .route("/api/v1/status", get(status))
-        .route("/api/v1/tasks", post(execute_task))
         .route("/api/v1/sessions", post(create_session))
         .route("/api/v1/sessions/{session_id}", delete(close_session))
+        .route("/api/v1/sessions/{session_id}/exec", post(execute_task))
         .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
 
     let app = Router::new()
@@ -155,16 +149,9 @@ async fn status(State(state): State<AppState>) -> Json<PoolStatus> {
 
 async fn create_session(
     State(state): State<AppState>,
-    payload: Option<Json<CreateSessionRequest>>,
+    Json(payload): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
-    let payload = payload.map(|Json(payload)| payload).unwrap_or_default();
-    let mut session_options = payload
-        .working_dir
-        .map(|working_dir| SessionOptions::default().working_dir(working_dir))
-        .unwrap_or_default();
-    if let Some(base_image) = payload.base_image {
-        session_options = session_options.base_image(base_image);
-    }
+    let session_options = SessionOptions::new(payload.image, payload.working_dir);
     let session_id = state
         .pool
         .create_session(session_options)
@@ -188,12 +175,9 @@ async fn close_session(
 
 async fn execute_task(
     State(state): State<AppState>,
+    Path(session_id): Path<String>,
     Json(payload): Json<ExecuteTaskRequest>,
 ) -> Result<Response, ApiError> {
-    let session_id = payload.session_id.trim().to_string();
-    if session_id.is_empty() {
-        return Err(ApiError::bad_request("session_id must not be empty"));
-    }
     let task = build_task(payload, state.pool.config())?;
 
     let result = state
@@ -207,7 +191,6 @@ async fn execute_task(
 
     Ok(Json(ExecuteTaskResponse {
         task_id: result.task_id,
-        session_id,
         exit_code: result.exit_code,
         timed_out: result.timed_out,
         duration_ms: result.duration.as_millis(),
@@ -263,7 +246,7 @@ impl ApiError {
 
     fn from_pool_error(error: PoolError) -> Self {
         match error {
-            PoolError::NoIdleSandbox(_) => Self {
+            PoolError::AtCapacity(_) => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: error.to_string(),
             },
@@ -299,9 +282,13 @@ mod tests {
 
     fn test_config() -> PoolConfig {
         PoolConfig::builder()
-            .base_image("/tmp/rootfs")
+            .images(apiary::ImagesConfig {
+                sources: vec!["test:latest".to_string()],
+                layers_dir: std::path::PathBuf::from("/tmp/test_layers"),
+                docker: "docker".to_string(),
+                pull_concurrency: 1,
+            })
             .default_timeout(Duration::from_secs(42))
-            .default_workdir("/workspace/default")
             .env("DEFAULT_KEY", "default-value")
             .build()
             .expect("config should build")
@@ -315,7 +302,6 @@ mod tests {
                 timeout_ms: None,
                 working_dir: None,
                 env: HashMap::new(),
-                session_id: "session-1".to_string(),
             },
             &test_config(),
         )
@@ -337,7 +323,6 @@ mod tests {
                 timeout_ms: None,
                 working_dir: Some(PathBuf::from("src")),
                 env: HashMap::new(),
-                session_id: "session-1".to_string(),
             },
             &test_config(),
         )
@@ -354,7 +339,6 @@ mod tests {
                 timeout_ms: None,
                 working_dir: None,
                 env: HashMap::new(),
-                session_id: "session-1".to_string(),
             },
             &test_config(),
         )
@@ -376,7 +360,6 @@ mod tests {
                 timeout_ms: Some(1_500),
                 working_dir: None,
                 env,
-                session_id: "session-1".to_string(),
             },
             &test_config(),
         )
@@ -391,8 +374,7 @@ mod tests {
     fn execute_task_request_rejects_removed_timeout_secs_field() {
         let error = serde_json::from_value::<ExecuteTaskRequest>(json!({
             "command": "echo hello",
-            "timeout_secs": 30,
-            "session_id": "session-1"
+            "timeout_secs": 30
         }))
         .expect_err("unknown timeout field should be rejected");
 

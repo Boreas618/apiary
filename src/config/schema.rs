@@ -11,34 +11,13 @@ use super::overlay::OverlayDriver;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PoolConfig {
-    /// Minimum number of sandboxes (created at startup, never scaled below).
-    #[serde(default = "default_min_sandboxes")]
-    pub min_sandboxes: usize,
-
-    /// Maximum number of sandboxes (hard ceiling for auto-scaling).
+    /// Maximum number of sandboxes (hard ceiling for concurrent sessions).
     #[serde(default = "default_max_sandboxes")]
     pub max_sandboxes: usize,
 
-    /// Number of sandboxes to create per scale-up event.
-    #[serde(default = "default_scale_up_step")]
-    pub scale_up_step: usize,
-
-    /// How long an excess sandbox (above min) can be idle before removal.
-    #[serde(default = "default_idle_timeout", with = "duration_serde")]
-    pub idle_timeout: Duration,
-
-    /// Minimum interval between scaling events to prevent thrashing.
-    #[serde(default = "default_cooldown", with = "duration_serde")]
-    pub cooldown: Duration,
-
-    /// Path to the base rootfs image (lower layer for OverlayFS).
-    pub base_image: PathBuf,
-
-    /// When a session sends `base_image` layer paths that are relative (or only
-    /// a layer id), resolve them under this directory (SWE-bench cache layout:
-    /// `{parent}/.layers/{sha256-hex}/`).
-    #[serde(default = "default_rootfs_layers_dir")]
-    pub rootfs_layers_dir: PathBuf,
+    /// Image registry configuration: which Docker images to load and where
+    /// to cache extracted layers.
+    pub images: ImagesConfig,
 
     /// Directory to store overlay layers.
     pub overlay_dir: PathBuf,
@@ -59,10 +38,6 @@ pub struct PoolConfig {
     #[serde(default = "default_timeout", with = "duration_serde")]
     pub default_timeout: Duration,
 
-    /// Default working directory inside sandbox.
-    #[serde(default = "default_workdir")]
-    pub default_workdir: PathBuf,
-
     /// Default environment variables for all tasks.
     #[serde(default)]
     pub default_env: HashMap<String, String>,
@@ -75,63 +50,39 @@ pub struct PoolConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mount_host_resolv_conf: bool,
 
-    /// Dump per-session execution history to CWD on close.
-    /// Runtime-only flag (set via `--dump-history` CLI flag, not the config file).
-    #[serde(skip)]
-    pub dump_history: bool,
-}
-
-fn default_min_sandboxes() -> usize {
-    10
+    /// Directory to write per-session execution logs on close. When set,
+    /// each session's history is written as `{session_id}.json` in this
+    /// directory. Disabled when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_log_dir: Option<PathBuf>,
 }
 
 fn default_max_sandboxes() -> usize {
     40
 }
 
-fn default_scale_up_step() -> usize {
-    2
-}
-
-fn default_idle_timeout() -> Duration {
-    Duration::from_secs(300)
-}
-
-fn default_cooldown() -> Duration {
-    Duration::from_secs(30)
-}
-
 fn default_timeout() -> Duration {
     Duration::from_secs(300)
-}
-
-fn default_workdir() -> PathBuf {
-    PathBuf::from("/workspace")
-}
-
-fn default_rootfs_layers_dir() -> PathBuf {
-    PathBuf::from("/tmp/apiary_rootfs/.layers")
 }
 
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            min_sandboxes: default_min_sandboxes(),
             max_sandboxes: default_max_sandboxes(),
-            scale_up_step: default_scale_up_step(),
-            idle_timeout: default_idle_timeout(),
-            cooldown: default_cooldown(),
-            base_image: PathBuf::from("./rootfs"),
-            rootfs_layers_dir: default_rootfs_layers_dir(),
+            images: ImagesConfig {
+                sources: vec!["ubuntu:22.04".to_string()],
+                layers_dir: default_layers_dir(),
+                docker: default_docker_bin(),
+                pull_concurrency: default_pull_concurrency(),
+            },
             overlay_dir: PathBuf::from("./overlays"),
             overlay_driver: OverlayDriver::default(),
             resource_limits: ResourceLimits::default(),
             seccomp_policy: SeccompPolicy::default(),
             default_timeout: default_timeout(),
-            default_workdir: default_workdir(),
             default_env: HashMap::new(),
             mount_host_resolv_conf: false,
-            dump_history: false,
+            session_log_dir: None,
         }
     }
 }
@@ -256,87 +207,110 @@ impl Default for SeccompPolicy {
     }
 }
 
+/// Image registry configuration.
+///
+/// Specifies which Docker images to make available and where to cache
+/// extracted layers.  The layer cache directory (`layers_dir`) **must** be
+/// on a local filesystem that supports xattr and device nodes (not NFS).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImagesConfig {
+    /// Docker image names or paths to files listing image names (one per
+    /// line). Each entry that is an existing file path is read as a list
+    /// file; everything else is treated as a Docker image name.
+    #[serde(default)]
+    pub sources: Vec<String>,
+
+    /// Local directory for content-addressable layer cache.
+    /// Must be on a filesystem with xattr + device node support (not NFS).
+    #[serde(default = "default_layers_dir")]
+    pub layers_dir: PathBuf,
+
+    /// Docker CLI binary path.
+    #[serde(default = "default_docker_bin")]
+    pub docker: String,
+
+    /// Max concurrent `docker pull` operations.
+    #[serde(default = "default_pull_concurrency")]
+    pub pull_concurrency: usize,
+}
+
+fn default_layers_dir() -> PathBuf {
+    PathBuf::from("/tmp/apiary_layers")
+}
+
+fn default_docker_bin() -> String {
+    "docker".to_string()
+}
+
+fn default_pull_concurrency() -> usize {
+    8
+}
+
+impl ImagesConfig {
+    /// Resolve a single source entry: if it is an existing file, read image
+    /// names from it; otherwise return the entry itself as an image name.
+    fn resolve_entry(entry: &str) -> anyhow::Result<Vec<String>> {
+        let path = std::path::Path::new(entry);
+        if path.is_file() {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read image list {}: {e}", path.display()))?;
+            Ok(text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(String::from)
+                .collect())
+        } else {
+            Ok(vec![entry.to_string()])
+        }
+    }
+
+    /// Resolve `sources` into a flat, deduplicated list of image names.
+    pub fn all_image_names(&self) -> anyhow::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in &self.sources {
+            names.extend(Self::resolve_entry(entry)?);
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+}
+
 impl PoolConfig {
     /// Validate invariants that must hold for the config to be usable.
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.min_sandboxes == 0 {
-            anyhow::bail!("min_sandboxes must be at least 1");
-        }
-        if self.max_sandboxes < self.min_sandboxes {
-            anyhow::bail!(
-                "max_sandboxes ({}) must be >= min_sandboxes ({})",
-                self.max_sandboxes,
-                self.min_sandboxes
-            );
-        }
-        if self.scale_up_step == 0 {
-            anyhow::bail!("scale_up_step must be at least 1");
+        if self.max_sandboxes == 0 {
+            anyhow::bail!("max_sandboxes must be at least 1");
         }
         Ok(())
-    }
-
-    /// Return a new config with adjusted pool bounds (validates invariants).
-    pub fn with_pool_bounds(mut self, min: usize, max: usize) -> anyhow::Result<Self> {
-        self.min_sandboxes = min;
-        self.max_sandboxes = max;
-        self.validate()?;
-        Ok(self)
     }
 }
 
 /// Builder for PoolConfig.
 #[derive(Debug, Default)]
 pub struct PoolConfigBuilder {
-    min_sandboxes: Option<usize>,
     max_sandboxes: Option<usize>,
-    scale_up_step: Option<usize>,
-    idle_timeout: Option<Duration>,
-    cooldown: Option<Duration>,
-    base_image: Option<PathBuf>,
-    rootfs_layers_dir: Option<PathBuf>,
+    images: Option<ImagesConfig>,
     overlay_dir: Option<PathBuf>,
     overlay_driver: Option<OverlayDriver>,
     resource_limits: Option<ResourceLimits>,
     seccomp_policy: Option<SeccompPolicy>,
     default_timeout: Option<Duration>,
-    default_workdir: Option<PathBuf>,
     default_env: Option<HashMap<String, String>>,
     mount_host_resolv_conf: Option<bool>,
 }
 
 impl PoolConfigBuilder {
-    pub fn min_sandboxes(mut self, n: usize) -> Self {
-        self.min_sandboxes = Some(n);
-        self
-    }
-
     pub fn max_sandboxes(mut self, n: usize) -> Self {
         self.max_sandboxes = Some(n);
         self
     }
 
-    pub fn scale_up_step(mut self, n: usize) -> Self {
-        self.scale_up_step = Some(n);
-        self
-    }
-
-    pub fn idle_timeout(mut self, d: Duration) -> Self {
-        self.idle_timeout = Some(d);
-        self
-    }
-
-    pub fn cooldown(mut self, d: Duration) -> Self {
-        self.cooldown = Some(d);
-        self
-    }
-
-    pub fn base_image<P: Into<PathBuf>>(mut self, path: P) -> Self {
-        self.base_image = Some(path.into());
-        self
-    }
-
-    pub fn rootfs_layers_dir<P: Into<PathBuf>>(mut self, path: P) -> Self {
-        self.rootfs_layers_dir = Some(path.into());
+    pub fn images(mut self, images: ImagesConfig) -> Self {
+        self.images = Some(images);
         self
     }
 
@@ -365,11 +339,6 @@ impl PoolConfigBuilder {
         self
     }
 
-    pub fn default_workdir<P: Into<PathBuf>>(mut self, path: P) -> Self {
-        self.default_workdir = Some(path.into());
-        self
-    }
-
     pub fn env<K: Into<String>, V: Into<String>>(mut self, key: K, value: V) -> Self {
         self.default_env
             .get_or_insert_with(HashMap::new)
@@ -384,17 +353,10 @@ impl PoolConfigBuilder {
 
     pub fn build(self) -> anyhow::Result<PoolConfig> {
         let config = PoolConfig {
-            min_sandboxes: self.min_sandboxes.unwrap_or_else(default_min_sandboxes),
             max_sandboxes: self.max_sandboxes.unwrap_or_else(default_max_sandboxes),
-            scale_up_step: self.scale_up_step.unwrap_or_else(default_scale_up_step),
-            idle_timeout: self.idle_timeout.unwrap_or_else(default_idle_timeout),
-            cooldown: self.cooldown.unwrap_or_else(default_cooldown),
-            base_image: self
-                .base_image
-                .ok_or_else(|| anyhow::anyhow!("base_image is required"))?,
-            rootfs_layers_dir: self
-                .rootfs_layers_dir
-                .unwrap_or_else(default_rootfs_layers_dir),
+            images: self
+                .images
+                .ok_or_else(|| anyhow::anyhow!("images config is required"))?,
             overlay_dir: self
                 .overlay_dir
                 .unwrap_or_else(super::PoolConfig::default_overlay_dir),
@@ -402,10 +364,9 @@ impl PoolConfigBuilder {
             resource_limits: self.resource_limits.unwrap_or_default(),
             seccomp_policy: self.seccomp_policy.unwrap_or_default(),
             default_timeout: self.default_timeout.unwrap_or_else(default_timeout),
-            default_workdir: self.default_workdir.unwrap_or_else(default_workdir),
             default_env: self.default_env.unwrap_or_default(),
-            mount_host_resolv_conf: self.mount_host_resolv_conf.unwrap_or(true), // by default, mount the host's resolv.conf
-            dump_history: false,
+            mount_host_resolv_conf: self.mount_host_resolv_conf.unwrap_or(true),
+            session_log_dir: None,
         };
         config.validate()?;
         Ok(config)
@@ -417,26 +378,35 @@ mod tests {
     use super::{PoolConfig, ResourceLimits};
     use std::path::PathBuf;
 
+    fn test_images_toml() -> &'static str {
+        r#"
+[images]
+sources = ["ubuntu:22.04"]
+layers_dir = "/tmp/test_layers"
+"#
+    }
+
     #[test]
     fn unknown_top_level_field_is_rejected() {
-        let error = toml::from_str::<PoolConfig>(
+        let input = format!(
             r#"
-base_image = "/tmp/rootfs"
 overlay_dir = "/tmp/overlays"
 unexpected_field = true
-"#,
-        )
-        .expect_err("unknown config fields must be rejected");
-
-        assert!(error.to_string().contains("unknown field"));
+{}"#,
+            test_images_toml()
+        );
+        let error =
+            toml::from_str::<PoolConfig>(&input).expect_err("unknown config fields must be rejected");
+        let msg = error.to_string();
+        assert!(msg.contains("unknown field"), "unexpected error: {msg}");
     }
 
     #[test]
     fn resource_limits_defaults_are_sane() {
         let limits = ResourceLimits::default();
-        assert_eq!(limits.memory_max, "2G");
-        assert_eq!(limits.pids_max, 256);
-        assert_eq!(limits.max_open_files, 1024);
+        assert_eq!(limits.memory_max, "4G");
+        assert_eq!(limits.pids_max, 2048);
+        assert_eq!(limits.max_open_files, 2048);
         assert_eq!(limits.rlimit_as_multiplier, 2);
         assert!(limits.max_file_size.is_none());
         assert!(limits.io_max.is_none());
@@ -472,50 +442,47 @@ memory_max = "1G"
         .expect("should deserialize with defaults for rlimit fields");
 
         assert_eq!(limits.memory_max, "1G");
-        assert_eq!(limits.max_open_files, 1024);
+        assert_eq!(limits.max_open_files, 2048);
         assert_eq!(limits.rlimit_as_multiplier, 2);
         assert!(limits.max_file_size.is_none());
     }
 
     #[test]
-    fn pool_config_with_rlimit_fields() {
-        let config: PoolConfig = toml::from_str(
+    fn pool_config_with_images_section() {
+        let config: PoolConfig = toml::from_str(&format!(
             r#"
-base_image = "/tmp/rootfs"
 overlay_dir = "/tmp/overlays"
 
 [resource_limits]
 memory_max = "8G"
 max_file_size = "2G"
 rlimit_as_multiplier = 4
+
+{}
 "#,
-        )
-        .expect("pool config should accept rlimit fields in resource_limits");
+            test_images_toml()
+        ))
+        .expect("pool config should accept images section");
 
         assert_eq!(config.resource_limits.memory_max, "8G");
-        assert_eq!(
-            config.resource_limits.max_file_size,
-            Some("2G".to_string())
-        );
-        assert_eq!(config.resource_limits.rlimit_as_multiplier, 4);
+        assert_eq!(config.images.sources, vec!["ubuntu:22.04"]);
+        assert_eq!(config.images.layers_dir, PathBuf::from("/tmp/test_layers"));
     }
 
     #[test]
-    fn pool_config_defaults_rootfs_layers_dir() {
-        let config: PoolConfig = toml::from_str(
+    fn images_config_defaults() {
+        let config: PoolConfig = toml::from_str(&format!(
             r#"
-base_image = "/tmp/rootfs"
 overlay_dir = "/tmp/overlays"
+{}
 "#,
-        )
+            test_images_toml()
+        ))
         .expect("pool config should parse");
 
-        assert_eq!(
-            config.rootfs_layers_dir,
-            PathBuf::from("/tmp/apiary_rootfs/.layers")
-        );
+        assert_eq!(config.images.docker, "docker");
+        assert_eq!(config.images.pull_concurrency, 8);
     }
-
 }
 
 pub fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>

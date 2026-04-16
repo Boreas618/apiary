@@ -2,7 +2,7 @@ services:
   apiary:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile.dev
     security_opt:
       - seccomp=unconfined
       - apparmor=unconfined

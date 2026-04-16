@@ -1,0 +1,21 @@
+[project]
+name = "apiary-client"
+version = "0.1.0"
+description = "Python client for the Apiary sandbox pool"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.24",
+]
+
+[project.optional-dependencies]
+swebench = ["datasets>=2.14"]
+mcp = [
+    "mcp>=1.26.0",
+    "starlette>=0.52.1",
+    "uvicorn>=0.41.0",
+    "uvloop>=0.21.0",
+]
+
+[project.scripts]
+apiary-resolve-images = "apiary_client.swebench.resolve_images:main"
+apiary-mcp = "apiary_client.mcp:main"

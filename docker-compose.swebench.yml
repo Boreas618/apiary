@@ -1,0 +1,42 @@
+services:
+  apiary-swebench:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.swebench
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+      - label=disable
+    ports:
+      - "${APIARY_PORT:-8080}:8080"
+    cap_add:
+      - SYS_ADMIN
+      - MKNOD
+    devices:
+      - /dev/fuse
+    cgroup: private
+    tmpfs:
+      - /sys/fs/cgroup:rw,mode=755
+    environment:
+      # SWE-bench image resolution
+      SWEBENCH_DATASET: "${SWEBENCH_DATASET:-lite}"
+      SWEBENCH_SPLIT: "${SWEBENCH_SPLIT:-test}"
+      SWEBENCH_BATCH_SIZE: "${SWEBENCH_BATCH_SIZE:-0}"
+      SWEBENCH_BATCH_ID: "${SWEBENCH_BATCH_ID:-0}"
+      # Apiary pool / daemon
+      APIARY_MAX_SANDBOXES: "${APIARY_MAX_SANDBOXES:-40}"
+      APIARY_BIND: "0.0.0.0:8080"
+      APIARY_API_TOKEN: "${APIARY_API_TOKEN:-}"
+      APIARY_LAYERS_DIR: /var/lib/apiary/layers
+      APIARY_IMAGE_LIST: "${APIARY_IMAGE_LIST:-}"
+      APIARY_OVERLAY_DIR: /var/lib/apiary/overlays
+      RUST_BACKTRACE: "1"
+    volumes:
+      - apiary-layers:/var/lib/apiary/layers
+      - apiary-overlays:/var/lib/apiary/overlays
+      - /etc/resolv.conf:/etc/resolv.conf:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  apiary-layers:
+  apiary-overlays:

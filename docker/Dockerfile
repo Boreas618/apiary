@@ -1,6 +1,27 @@
 # syntax=docker/dockerfile:1
+#
+# Production image: multi-stage build producing a minimal runtime container.
 
-FROM rust:1-bookworm
+# ── Stage 1: Build ───────────────────────────────────────────────────────────
+
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+
+# Cache dependency compilation: copy manifests first, build a dummy crate,
+# then replace with real source so only application code changes bust cache.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > src/lib.rs \
+    && cargo build --release \
+    && rm -rf src
+
+COPY src/ src/
+RUN touch src/main.rs src/lib.rs && cargo build --release
+
+# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
+
+FROM debian:bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -10,9 +31,10 @@ RUN apt-get update \
         fuse-overlayfs \
         util-linux \
         iproute2 \
-        procps \
     && rm -rf /var/lib/apt/lists/*
 
+# Docker CLI only — needed for `docker inspect` / layer extraction at init.
+# The daemon itself is not installed; mount the host socket at runtime.
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \
@@ -27,12 +49,7 @@ RUN install -m 0755 -d /etc/apt/keyrings \
         echo "Signed-By: /etc/apt/keyrings/docker.asc"; \
     } > /etc/apt/sources.list.d/docker.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        docker-ce \
-        docker-ce-cli \
-        containerd.io \
-        docker-buildx-plugin \
-        docker-compose-plugin \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
 RUN echo "root:100000:65536" >> /etc/subuid \
@@ -40,13 +57,12 @@ RUN echo "root:100000:65536" >> /etc/subuid \
 
 RUN test -x /usr/bin/newuidmap && test -x /usr/bin/newgidmap
 
+COPY --from=builder /src/target/release/apiary /usr/local/bin/apiary
 COPY docker/entrypoint.sh     /usr/local/bin/entrypoint.sh
 COPY docker/verify-sandbox.sh /usr/local/bin/verify-sandbox.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/verify-sandbox.sh
 
-WORKDIR /workspace
-
 EXPOSE 8080
 
 ENTRYPOINT ["entrypoint.sh"]
-CMD ["bash"]
+CMD ["apiary", "daemon", "--bind", "0.0.0.0:8080"]

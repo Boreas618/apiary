@@ -141,24 +141,12 @@ fn merge_host_resolv_readonly_mounts(
     out
 }
 
-/// Resolve one overlay lower directory for [`Sandbox::initialize`].
-///
-/// With `session_layers_base` (per-session `base_image`): `rootfs_layers_dir.join(path)`
-/// then canonicalize. If `path` is absolute, [`Path::join`] keeps that absolute path
-/// (same as passing a full lower dir). Without a base, require `path` to canonicalize as given.
-fn resolve_lower_dir(
-    p: &Path,
-    session_layers_base: Option<&Path>,
-) -> Result<PathBuf, SandboxError> {
-    let candidate = match session_layers_base {
-        Some(base) => base.join(p),
-        None => p.to_path_buf(),
-    };
-    candidate.canonicalize().map_err(|e| {
+/// Canonicalize one overlay lower directory for [`Sandbox::initialize`].
+fn resolve_lower_dir(p: &Path) -> Result<PathBuf, SandboxError> {
+    p.canonicalize().map_err(|e| {
         SandboxError::OverlaySetup(format!(
-            "lower dir not found at {} (resolved as {}): {e}",
+            "lower dir not found at {}: {e}",
             p.display(),
-            candidate.display()
         ))
     })
 }
@@ -218,23 +206,18 @@ impl Sandbox {
     /// Initialize the sandbox.
     ///
     /// `lower_dirs` lists layer directories in bottom-to-top order (base
-    /// first, topmost last).  A single-element slice is the common case
-    /// for pool-default sandboxes backed by a flat rootfs.
-    ///
-    /// `session_layers_base`: when `Some`, each session `base_image` path is
-    /// `join`ed to this directory (typically `/tmp/apiary_rootfs/.layers`) and
-    /// then canonicalized.  Use `None` for the pool default rootfs path only.
+    /// first, topmost last).  All paths must be absolute and already exist
+    /// (the image registry ensures this at startup).
     pub async fn initialize(
         &mut self,
         lower_dirs: &[PathBuf],
         driver: &OverlayDriver,
-        session_layers_base: Option<&Path>,
     ) -> Result<(), SandboxError> {
         self.set_state(SandboxState::Creating);
 
         let canonical_lowers: Vec<PathBuf> = lower_dirs
             .iter()
-            .map(|p| resolve_lower_dir(p, session_layers_base))
+            .map(|p| resolve_lower_dir(p))
             .collect::<Result<_, _>>()?;
 
         let active = overlay::setup_overlay(
