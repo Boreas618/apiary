@@ -62,7 +62,15 @@ COPY docker/entrypoint.sh     /usr/local/bin/entrypoint.sh
 COPY docker/verify-sandbox.sh /usr/local/bin/verify-sandbox.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/verify-sandbox.sh
 
+# Default config: layers cached locally, overlays under /var/lib.
+ENV APIARY_OVERLAY_DIR=/var/lib/apiary/overlays
+ENV APIARY_LAYERS_DIR=/var/lib/apiary/layers
+ENV APIARY_BIND=0.0.0.0:8080
+
 EXPOSE 8080
 
 ENTRYPOINT ["entrypoint.sh"]
-CMD ["apiary", "daemon", "--bind", "0.0.0.0:8080"]
+# Container starts with an empty image registry. Clients populate it via
+# `POST /api/v1/images` against the running daemon (see README, "Loading
+# images at runtime").
+CMD ["sh", "-c", "apiary init --layers-dir \"$APIARY_LAYERS_DIR\" --overlay-dir \"$APIARY_OVERLAY_DIR\" && exec apiary daemon --bind \"$APIARY_BIND\""]

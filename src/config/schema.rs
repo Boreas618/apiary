@@ -15,9 +15,11 @@ pub struct PoolConfig {
     #[serde(default = "default_max_sandboxes")]
     pub max_sandboxes: usize,
 
-    /// Image registry configuration: which Docker images to load and where
-    /// to cache extracted layers.
-    pub images: ImagesConfig,
+    /// Layer cache configuration: where to store extracted Docker layers
+    /// and how to talk to the Docker daemon. Images themselves are
+    /// registered at runtime via the HTTP API.
+    #[serde(default)]
+    pub image_cache: LayerCacheConfig,
 
     /// Directory to store overlay layers.
     pub overlay_dir: PathBuf,
@@ -69,12 +71,7 @@ impl Default for PoolConfig {
     fn default() -> Self {
         Self {
             max_sandboxes: default_max_sandboxes(),
-            images: ImagesConfig {
-                sources: vec!["ubuntu:22.04".to_string()],
-                layers_dir: default_layers_dir(),
-                docker: default_docker_bin(),
-                pull_concurrency: default_pull_concurrency(),
-            },
+            image_cache: LayerCacheConfig::default(),
             overlay_dir: PathBuf::from("./overlays"),
             overlay_driver: OverlayDriver::default(),
             resource_limits: ResourceLimits::default(),
@@ -207,20 +204,19 @@ impl Default for SeccompPolicy {
     }
 }
 
-/// Image registry configuration.
+/// Layer cache configuration.
 ///
-/// Specifies which Docker images to make available and where to cache
-/// extracted layers.  The layer cache directory (`layers_dir`) **must** be
-/// on a local filesystem that supports xattr and device nodes (not NFS).
+/// Specifies where extracted Docker layers are cached on disk and how the
+/// daemon talks to Docker for pulling/inspection.  The cache directory
+/// (`layers_dir`) **must** be on a local filesystem that supports xattr
+/// and device nodes (not NFS).
+///
+/// This struct **does not** enumerate which images the pool serves —
+/// images are registered at runtime via the HTTP API
+/// (`POST /api/v1/images`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ImagesConfig {
-    /// Docker image names or paths to files listing image names (one per
-    /// line). Each entry that is an existing file path is read as a list
-    /// file; everything else is treated as a Docker image name.
-    #[serde(default)]
-    pub sources: Vec<String>,
-
+pub struct LayerCacheConfig {
     /// Local directory for content-addressable layer cache.
     /// Must be on a filesystem with xattr + device node support (not NFS).
     #[serde(default = "default_layers_dir")]
@@ -230,7 +226,7 @@ pub struct ImagesConfig {
     #[serde(default = "default_docker_bin")]
     pub docker: String,
 
-    /// Max concurrent `docker pull` operations.
+    /// Max concurrent image-load operations (docker pull + extract).
     #[serde(default = "default_pull_concurrency")]
     pub pull_concurrency: usize,
 }
@@ -247,36 +243,14 @@ fn default_pull_concurrency() -> usize {
     8
 }
 
-impl ImagesConfig {
-    /// Resolve a single source entry: if it is an existing file, read image
-    /// names from it; otherwise return the entry itself as an image name.
-    fn resolve_entry(entry: &str) -> anyhow::Result<Vec<String>> {
-        let path = std::path::Path::new(entry);
-        if path.is_file() {
-            let text = std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("read image list {}: {e}", path.display()))?;
-            Ok(text
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(String::from)
-                .collect())
-        } else {
-            Ok(vec![entry.to_string()])
+impl Default for LayerCacheConfig {
+    fn default() -> Self {
+        Self {
+            layers_dir: default_layers_dir(),
+            docker: default_docker_bin(),
+            pull_concurrency: default_pull_concurrency(),
         }
     }
-
-    /// Resolve `sources` into a flat, deduplicated list of image names.
-    pub fn all_image_names(&self) -> anyhow::Result<Vec<String>> {
-        let mut names = Vec::new();
-        for entry in &self.sources {
-            names.extend(Self::resolve_entry(entry)?);
-        }
-        names.sort();
-        names.dedup();
-        Ok(names)
-    }
-
 }
 
 impl PoolConfig {
@@ -293,7 +267,7 @@ impl PoolConfig {
 #[derive(Debug, Default)]
 pub struct PoolConfigBuilder {
     max_sandboxes: Option<usize>,
-    images: Option<ImagesConfig>,
+    image_cache: Option<LayerCacheConfig>,
     overlay_dir: Option<PathBuf>,
     overlay_driver: Option<OverlayDriver>,
     resource_limits: Option<ResourceLimits>,
@@ -309,8 +283,8 @@ impl PoolConfigBuilder {
         self
     }
 
-    pub fn images(mut self, images: ImagesConfig) -> Self {
-        self.images = Some(images);
+    pub fn image_cache(mut self, image_cache: LayerCacheConfig) -> Self {
+        self.image_cache = Some(image_cache);
         self
     }
 
@@ -354,9 +328,7 @@ impl PoolConfigBuilder {
     pub fn build(self) -> anyhow::Result<PoolConfig> {
         let config = PoolConfig {
             max_sandboxes: self.max_sandboxes.unwrap_or_else(default_max_sandboxes),
-            images: self
-                .images
-                .ok_or_else(|| anyhow::anyhow!("images config is required"))?,
+            image_cache: self.image_cache.unwrap_or_default(),
             overlay_dir: self
                 .overlay_dir
                 .unwrap_or_else(super::PoolConfig::default_overlay_dir),
@@ -378,10 +350,9 @@ mod tests {
     use super::{PoolConfig, ResourceLimits};
     use std::path::PathBuf;
 
-    fn test_images_toml() -> &'static str {
+    fn test_image_cache_toml() -> &'static str {
         r#"
-[images]
-sources = ["ubuntu:22.04"]
+[image_cache]
 layers_dir = "/tmp/test_layers"
 "#
     }
@@ -393,12 +364,30 @@ layers_dir = "/tmp/test_layers"
 overlay_dir = "/tmp/overlays"
 unexpected_field = true
 {}"#,
-            test_images_toml()
+            test_image_cache_toml()
         );
         let error =
             toml::from_str::<PoolConfig>(&input).expect_err("unknown config fields must be rejected");
         let msg = error.to_string();
         assert!(msg.contains("unknown field"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn legacy_images_section_is_rejected() {
+        let input = r#"
+overlay_dir = "/tmp/overlays"
+
+[images]
+sources = ["ubuntu:22.04"]
+layers_dir = "/tmp/test_layers"
+"#;
+        let error = toml::from_str::<PoolConfig>(input)
+            .expect_err("legacy [images] section must be rejected");
+        let msg = error.to_string();
+        assert!(
+            msg.contains("unknown field") && msg.contains("images"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -448,7 +437,7 @@ memory_max = "1G"
     }
 
     #[test]
-    fn pool_config_with_images_section() {
+    fn pool_config_with_image_cache_section() {
         let config: PoolConfig = toml::from_str(&format!(
             r#"
 overlay_dir = "/tmp/overlays"
@@ -460,28 +449,47 @@ rlimit_as_multiplier = 4
 
 {}
 "#,
-            test_images_toml()
+            test_image_cache_toml()
         ))
-        .expect("pool config should accept images section");
+        .expect("pool config should accept image_cache section");
 
         assert_eq!(config.resource_limits.memory_max, "8G");
-        assert_eq!(config.images.sources, vec!["ubuntu:22.04"]);
-        assert_eq!(config.images.layers_dir, PathBuf::from("/tmp/test_layers"));
+        assert_eq!(
+            config.image_cache.layers_dir,
+            PathBuf::from("/tmp/test_layers")
+        );
     }
 
     #[test]
-    fn images_config_defaults() {
+    fn pool_config_without_image_cache_uses_defaults() {
+        let config: PoolConfig = toml::from_str(
+            r#"
+overlay_dir = "/tmp/overlays"
+"#,
+        )
+        .expect("pool config should parse with no image_cache section");
+
+        assert_eq!(config.image_cache.docker, "docker");
+        assert_eq!(config.image_cache.pull_concurrency, 8);
+        assert_eq!(
+            config.image_cache.layers_dir,
+            PathBuf::from("/tmp/apiary_layers")
+        );
+    }
+
+    #[test]
+    fn image_cache_defaults() {
         let config: PoolConfig = toml::from_str(&format!(
             r#"
 overlay_dir = "/tmp/overlays"
 {}
 "#,
-            test_images_toml()
+            test_image_cache_toml()
         ))
         .expect("pool config should parse");
 
-        assert_eq!(config.images.docker, "docker");
-        assert_eq!(config.images.pull_concurrency, 8);
+        assert_eq!(config.image_cache.docker, "docker");
+        assert_eq!(config.image_cache.pull_concurrency, 8);
     }
 }
 

@@ -1,4 +1,16 @@
 //! HTTP server for daemon mode.
+//!
+//! Routes (all under `auth_layer` if `--api-token` is set):
+//!
+//! - `GET    /healthz`
+//! - `GET    /api/v1/status`
+//! - `POST   /api/v1/sessions` — create a session for a registered image
+//! - `DELETE /api/v1/sessions/{id}`
+//! - `POST   /api/v1/sessions/{id}/exec`
+//! - `GET    /api/v1/images` — list registered images
+//! - `POST   /api/v1/images` — submit an async image-load job
+//! - `DELETE /api/v1/images/{name}` — drop an image from the registry
+//! - `GET    /api/v1/images/jobs/{job_id}` — poll image-load job status
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,7 +24,9 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use apiary::{Pool, PoolConfig, PoolError, PoolStatus, SessionOptions, Task};
+use apiary::{
+    ImageJob, JobAck, Pool, PoolConfig, PoolError, PoolStatus, SessionOptions, Task,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -39,6 +53,18 @@ struct CreateSessionRequest {
     image: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterImagesRequest {
+    images: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListImagesResponse {
+    images: Vec<String>,
+    count: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct ExecuteTaskResponse {
     task_id: String,
@@ -61,6 +87,14 @@ struct ErrorResponse {
 }
 
 pub async fn run_server(bind: String, pool: Pool, api_token: Option<String>) -> anyhow::Result<()> {
+    // An empty token is never a valid Bearer credential: with `Some("")` the
+    // auth layer would require `Authorization: Bearer ` (trailing space, empty
+    // token), which no reasonable HTTP client emits, locking the API out.
+    // `clap`'s `env = "APIARY_API_TOKEN"` also yields `Some("")` whenever the
+    // env var is exported as empty (a common outcome of
+    // `APIARY_API_TOKEN: "${APIARY_API_TOKEN:-}"` in Compose).
+    let api_token = api_token.filter(|t| !t.is_empty());
+
     let state = AppState {
         pool,
         api_token: api_token.clone(),
@@ -71,6 +105,9 @@ pub async fn run_server(bind: String, pool: Pool, api_token: Option<String>) -> 
         .route("/api/v1/sessions", post(create_session))
         .route("/api/v1/sessions/{session_id}", delete(close_session))
         .route("/api/v1/sessions/{session_id}/exec", post(execute_task))
+        .route("/api/v1/images", get(list_images).post(register_images))
+        .route("/api/v1/images/{name}", delete(unregister_image))
+        .route("/api/v1/images/jobs/{job_id}", get(image_job_status))
         .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
 
     let app = Router::new()
@@ -80,6 +117,8 @@ pub async fn run_server(bind: String, pool: Pool, api_token: Option<String>) -> 
 
     if api_token.is_some() {
         tracing::info!("API authentication enabled (Bearer token required)");
+    } else {
+        tracing::info!("API authentication disabled (no APIARY_API_TOKEN configured)");
     }
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -201,6 +240,60 @@ async fn execute_task(
     .into_response())
 }
 
+// ---------------------------------------------------------------------------
+// Image registry endpoints
+// ---------------------------------------------------------------------------
+
+async fn list_images(State(state): State<AppState>) -> Json<ListImagesResponse> {
+    let images = state.pool.image_registry().list();
+    let count = images.len();
+    Json(ListImagesResponse { images, count })
+}
+
+async fn register_images(
+    State(state): State<AppState>,
+    Json(payload): Json<RegisterImagesRequest>,
+) -> Result<(StatusCode, Json<JobAck>), ApiError> {
+    let images: Vec<String> = payload
+        .images
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if images.is_empty() {
+        return Err(ApiError::bad_request(
+            "request body `images` must contain at least one non-empty name",
+        ));
+    }
+
+    let ack = state.pool.image_jobs().submit(images);
+    Ok((StatusCode::ACCEPTED, Json(ack)))
+}
+
+async fn unregister_image(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let removed = state.pool.image_registry().remove(&name);
+    if removed.is_some() {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found(format!("image not registered: {name}")))
+    }
+}
+
+async fn image_job_status(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<ImageJob>, ApiError> {
+    state
+        .pool
+        .image_jobs()
+        .status(&job_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("image job not found: {job_id}")))
+}
+
 fn build_task(payload: ExecuteTaskRequest, config: &PoolConfig) -> Result<Task, ApiError> {
     let command = payload.command.trim();
     if command.is_empty() {
@@ -237,6 +330,13 @@ impl ApiError {
         }
     }
 
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -257,6 +357,12 @@ impl ApiError {
             PoolError::SessionNotFound(session_id) => Self {
                 status: StatusCode::NOT_FOUND,
                 message: format!("session not found: {session_id}"),
+            },
+            PoolError::UnknownImage(name) => Self {
+                status: StatusCode::NOT_FOUND,
+                message: format!(
+                    "image not registered: {name}. POST /api/v1/images to register it first."
+                ),
             },
             other => Self::internal(other.to_string()),
         }
@@ -282,8 +388,7 @@ mod tests {
 
     fn test_config() -> PoolConfig {
         PoolConfig::builder()
-            .images(apiary::ImagesConfig {
-                sources: vec!["test:latest".to_string()],
+            .image_cache(apiary::LayerCacheConfig {
                 layers_dir: std::path::PathBuf::from("/tmp/test_layers"),
                 docker: "docker".to_string(),
                 pull_concurrency: 1,
@@ -381,4 +486,21 @@ mod tests {
         assert!(error.to_string().contains("unknown field `timeout_secs`"));
     }
 
+    #[test]
+    fn unknown_image_pool_error_maps_to_404() {
+        let err = ApiError::from_pool_error(PoolError::UnknownImage("ubuntu:22.04".to_string()));
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert!(err.message.contains("ubuntu:22.04"));
+        assert!(err.message.contains("POST /api/v1/images"));
+    }
+
+    #[test]
+    fn register_images_request_rejects_unknown_fields() {
+        let error = serde_json::from_value::<RegisterImagesRequest>(json!({
+            "images": ["ubuntu:22.04"],
+            "unexpected": true
+        }))
+        .expect_err("unknown fields should be rejected");
+        assert!(error.to_string().contains("unknown field"));
+    }
 }

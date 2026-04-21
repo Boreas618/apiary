@@ -17,5 +17,5 @@ mcp = [
 ]
 
 [project.scripts]
-apiary-resolve-images = "apiary_client.swebench.resolve_images:main"
+apiary-load-swebench = "apiary_client.swebench.load:main"
 apiary-mcp = "apiary_client.mcp:main"

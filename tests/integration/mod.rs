@@ -8,7 +8,7 @@
 //! Some tests may be skipped if run without proper permissions or on
 //! unsupported systems.
 
-use apiary::{PoolConfig, Task, TaskResult};
+use apiary::{LayerCacheConfig, PoolConfig, Task, TaskResult};
 use std::time::Duration;
 
 #[test]
@@ -37,8 +37,7 @@ fn test_task_builder() {
 fn test_config_builder() {
     let config = PoolConfig::builder()
         .max_sandboxes(20)
-        .images(apiary::ImagesConfig {
-            sources: vec!["test:latest".to_string()],
+        .image_cache(LayerCacheConfig {
             layers_dir: "/tmp/test_layers".into(),
             docker: "docker".to_string(),
             pull_concurrency: 1,
@@ -51,17 +50,18 @@ fn test_config_builder() {
 }
 
 #[test]
-fn test_config_builder_requires_images() {
+fn test_config_builder_works_without_explicit_image_cache() {
     let result = PoolConfig::builder().build();
-    assert!(result.is_err());
+    assert!(result.is_ok(), "image_cache is now optional with sane defaults");
+    let config = result.unwrap();
+    assert_eq!(config.image_cache.docker, "docker");
 }
 
 #[test]
 fn test_config_serialization() {
     let config = PoolConfig::builder()
         .max_sandboxes(40)
-        .images(apiary::ImagesConfig {
-            sources: vec!["test:latest".to_string()],
+        .image_cache(LayerCacheConfig {
             layers_dir: "/tmp/test_layers".into(),
             docker: "docker".to_string(),
             pull_concurrency: 1,
@@ -71,6 +71,7 @@ fn test_config_serialization() {
 
     let toml_str = toml::to_string(&config).unwrap();
     assert!(toml_str.contains("max_sandboxes = 40"));
+    assert!(toml_str.contains("[image_cache]"));
 
     let parsed: PoolConfig = toml::from_str(&toml_str).unwrap();
     assert_eq!(parsed.max_sandboxes, config.max_sandboxes);
@@ -122,19 +123,22 @@ mod linux_tests {
     }
 
     #[tokio::test]
-    async fn test_pool_creation_with_bad_image() {
+    async fn test_pool_starts_empty() {
+        let tmp = tempfile::tempdir().expect("temp dir");
         let config = PoolConfig::builder()
             .max_sandboxes(4)
-            .images(apiary::ImagesConfig {
-                sources: vec!["nonexistent:image".to_string()],
-                layers_dir: "/nonexistent/layers".into(),
+            .image_cache(LayerCacheConfig {
+                layers_dir: tmp.path().join("layers"),
                 docker: "docker".to_string(),
                 pull_concurrency: 1,
             })
+            .overlay_dir(tmp.path().join("overlays"))
             .build()
             .unwrap();
 
-        let result = Pool::new(config).await;
-        assert!(result.is_err());
+        let pool = Pool::new(config).await.expect("pool creation should succeed");
+        assert_eq!(pool.status().registered_images, 0);
+        assert!(pool.image_registry().is_empty());
+        pool.shutdown().await;
     }
 }

@@ -2,6 +2,10 @@
 //!
 //! Every session creates a dedicated sandbox for the requested image and
 //! destroys it on close. `max_sandboxes` acts as a hard concurrency cap.
+//!
+//! The pool also owns the runtime image registry and an [`ImageLoader`]
+//! / [`ImageJobs`] tracker so clients can register images via HTTP after
+//! the daemon starts.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -11,9 +15,10 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use thiserror::Error;
 
+use super::image_jobs::ImageJobs;
 use super::session::SessionHandle;
 use crate::config::PoolConfig;
-use crate::images::ImageRegistry;
+use crate::images::{ImageLoader, ImageRegistry, LayerExtractor};
 use crate::sandbox::monitor::ProcessMonitor;
 use crate::sandbox::{cgroup, Sandbox, SandboxError, SandboxState};
 
@@ -41,6 +46,9 @@ pub enum PoolError {
     #[error("session not found: {0}")]
     SessionNotFound(String),
 
+    #[error("image not registered: {0}")]
+    UnknownImage(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -56,6 +64,7 @@ pub struct PoolStatus {
     pub tasks_succeeded: u64,
     pub tasks_failed: u64,
     pub avg_task_duration_ms: u64,
+    pub registered_images: usize,
 }
 
 /// A sandbox pool that manages multiple sandboxes for task execution.
@@ -70,27 +79,20 @@ pub struct Pool {
     /// unavailable. Created once during pool init and injected into every
     /// sandbox so a single background task polls all tracked processes.
     pub(super) process_monitor: Option<ProcessMonitor>,
-    /// Image registry mapping image names to local layer paths.
+    /// Runtime image registry. Always starts empty; clients register
+    /// images via the HTTP API.
     pub(super) image_registry: Arc<ImageRegistry>,
+    /// Async pull+extract pipeline backed by the registry above.
+    pub(super) image_loader: ImageLoader,
+    /// Tracker for in-flight and historical image-load jobs.
+    pub(super) image_jobs: ImageJobs,
 }
 
 impl Pool {
     pub async fn new(config: PoolConfig) -> Result<Self, PoolError> {
-        let image_names = config
-            .images
-            .all_image_names()
-            .map_err(|e| PoolError::InitFailed(e.to_string()))?;
-
-        tracing::info!(
-            "building image registry: {} images",
-            image_names.len(),
-        );
-        let registry = ImageRegistry::ensure_all(
-            &image_names,
-            &config.images.layers_dir,
-            &config.images.docker,
-        )
-        .map_err(|e| PoolError::InitFailed(e.to_string()))?;
+        // The layer cache directory must exist before extraction can run.
+        std::fs::create_dir_all(&config.image_cache.layers_dir)
+            .map_err(|e| PoolError::InitFailed(format!("create layers_dir: {e}")))?;
 
         let monitor = if !cgroup::has_delegated_cgroup() {
             tracing::info!(
@@ -122,6 +124,22 @@ impl Pool {
             }
         }
 
+        let registry = Arc::new(ImageRegistry::new(&config.image_cache.layers_dir));
+        let extractor = Arc::new(
+            LayerExtractor::new(
+                config.image_cache.layers_dir.clone(),
+                config.image_cache.docker.clone(),
+            )
+            .map_err(|e| PoolError::InitFailed(e.to_string()))?,
+        );
+        let loader = ImageLoader::new(
+            registry.clone(),
+            extractor,
+            config.image_cache.docker.clone(),
+            config.image_cache.pull_concurrency,
+        );
+        let jobs = ImageJobs::new(loader.clone(), registry.clone());
+
         let pool = Self {
             config: Arc::new(config),
             sandboxes: Arc::new(RwLock::new(HashMap::new())),
@@ -129,20 +147,38 @@ impl Pool {
             shutdown: Arc::new(AtomicBool::new(false)),
             next_sandbox_id: Arc::new(AtomicUsize::new(0)),
             process_monitor: monitor,
-            image_registry: Arc::new(registry),
+            image_registry: registry,
+            image_loader: loader,
+            image_jobs: jobs,
         };
 
         tracing::info!(
-            "pool ready (max_sandboxes={})",
+            "pool ready (max_sandboxes={}, registry empty - register images via API)",
             pool.config.max_sandboxes,
         );
 
         Ok(pool)
     }
 
+    /// Borrow the runtime image registry (callers can list/check images).
+    pub fn image_registry(&self) -> &Arc<ImageRegistry> {
+        &self.image_registry
+    }
+
+    /// Borrow the image loader (drives pull + extract on demand).
+    pub fn image_loader(&self) -> &ImageLoader {
+        &self.image_loader
+    }
+
+    /// Borrow the image-jobs tracker (HTTP layer uses this for register/poll).
+    pub fn image_jobs(&self) -> &ImageJobs {
+        &self.image_jobs
+    }
+
     /// Create a sandbox for a named image from the registry.
     ///
-    /// Returns `PoolError::AtCapacity` if `max_sandboxes` has been reached.
+    /// Returns `PoolError::AtCapacity` if `max_sandboxes` has been reached,
+    /// or `PoolError::UnknownImage` if the image is not registered.
     pub(super) async fn create_sandbox_for_image(
         &self,
         image_name: &str,
@@ -157,7 +193,7 @@ impl Pool {
         let layers = self
             .image_registry
             .resolve(image_name)
-            .ok_or_else(|| PoolError::InitFailed(format!("unknown image: {image_name}")))?;
+            .ok_or_else(|| PoolError::UnknownImage(image_name.to_string()))?;
 
         let idx = self.next_sandbox_id.fetch_add(1, Ordering::Relaxed);
         let sandbox_id = format!("sandbox-{idx}");
@@ -175,7 +211,7 @@ impl Pool {
         }
 
         sandbox
-            .initialize(layers, &self.config.overlay_driver)
+            .initialize(&layers, &self.config.overlay_driver)
             .await
             .map_err(|e| PoolError::InitFailed(e.to_string()))?;
 
@@ -239,6 +275,7 @@ impl Pool {
             tasks_succeeded,
             tasks_failed,
             avg_task_duration_ms: avg_duration,
+            registered_images: self.image_registry.len(),
         }
     }
 
@@ -249,6 +286,10 @@ impl Pool {
     pub async fn shutdown(&self) {
         tracing::info!("Shutting down pool...");
         self.shutdown.store(true, Ordering::Relaxed);
+
+        // Cancel any in-flight image-load jobs first so the worker tasks
+        // stop racing with sandbox teardown.
+        self.image_jobs.shutdown().await;
 
         let session_ids: Vec<String> = self.sessions.read().keys().cloned().collect();
         for session_id in session_ids {

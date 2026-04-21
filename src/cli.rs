@@ -1,10 +1,17 @@
 //! CLI command implementations.
+//!
+//! Three commands:
+//!
+//! - `init` writes a fresh config file and prepares overlay/cache dirs.
+//!   It does **not** know anything about images — they are registered at
+//!   runtime via the daemon's HTTP API.
+//! - `daemon` loads the config and starts the HTTP server.
+//! - `status` / `clean` are utility commands that read the config.
 
 use std::path::PathBuf;
 
-use apiary::{ImagesConfig, Pool, PoolConfig};
+use apiary::{LayerCacheConfig, Pool, PoolConfig};
 use clap::{Parser, Subcommand};
-use tokio::task::JoinSet;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::server;
@@ -31,12 +38,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize the sandbox pool
+    /// Initialize the sandbox pool (config + directories).
+    ///
+    /// No images are pre-loaded. Clients register images at runtime via
+    /// `POST /api/v1/images` against a running daemon.
     Init {
-        /// Docker image names or paths to image-list files (repeatable).
-        #[arg(long = "image", required = true)]
-        images: Vec<String>,
-
         /// Local directory for content-addressable layer cache
         #[arg(long, default_value = "/tmp/apiary_layers")]
         layers_dir: PathBuf,
@@ -56,7 +62,8 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: String,
 
-        /// Bearer token for API authentication (also reads APIARY_API_TOKEN env)
+        /// Bearer token for API authentication (also reads APIARY_API_TOKEN env).
+        /// Unset or empty disables authentication entirely.
         #[arg(long, env = "APIARY_API_TOKEN")]
         api_token: Option<String>,
     },
@@ -100,19 +107,11 @@ async fn async_main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Init {
-            images,
             layers_dir,
             max_sandboxes,
             overlay_dir,
         } => {
-            init_pool(
-                images,
-                layers_dir,
-                max_sandboxes,
-                overlay_dir,
-                config_path,
-            )
-            .await?;
+            init_pool(layers_dir, max_sandboxes, overlay_dir, config_path).await?;
         }
         Commands::Daemon { bind, api_token } => {
             run_daemon(bind, api_token, config_path).await?;
@@ -147,19 +146,20 @@ fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<(PoolConfig, Path
     Ok((config, config_file))
 }
 
-/// Initialize the sandbox pool.
+/// Initialize the sandbox pool: write config, create directories.
+///
+/// No images are pulled or extracted here — the registry is populated
+/// at runtime via the HTTP API.
 pub async fn init_pool(
-    images: Vec<String>,
     layers_dir: PathBuf,
     max_sandboxes: usize,
     overlay_dir: Option<PathBuf>,
     config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    tracing::info!("Initializing sandbox pool...");
+    tracing::info!("Initializing sandbox pool config...");
 
     let overlay_dir = overlay_dir.unwrap_or_else(PoolConfig::default_overlay_dir);
-    let images_config = ImagesConfig {
-        sources: images,
+    let image_cache = LayerCacheConfig {
         layers_dir,
         docker: "docker".to_string(),
         pull_concurrency: 8,
@@ -167,7 +167,7 @@ pub async fn init_pool(
 
     let config = PoolConfig::builder()
         .max_sandboxes(max_sandboxes)
-        .images(images_config)
+        .image_cache(image_cache)
         .overlay_dir(&overlay_dir)
         .build()?;
 
@@ -182,84 +182,27 @@ pub async fn init_pool(
     std::fs::create_dir_all(&overlay_dir)?;
     tracing::info!("Overlay directory: {}", overlay_dir.display());
 
-    pull_missing_images(&config).await?;
-
-    tracing::info!("Testing pool initialization...");
-    let pool = Pool::new(config).await?;
-
-    println!("Pool initialized successfully!");
-    println!("  Max sandboxes: {max_sandboxes}");
-    println!("  Seccomp: enabled");
-    println!("  Config file: {}", config_file.display());
-    println!("  Overlay dir: {}", overlay_dir.display());
-
-    pool.shutdown().await;
-    Ok(())
-}
-
-/// Pull any images that are not yet available in the local Docker daemon.
-async fn pull_missing_images(config: &PoolConfig) -> anyhow::Result<()> {
-    let names = config.images.all_image_names()?;
-    let docker = &config.images.docker;
-
-    let missing: Vec<_> = names
-        .iter()
-        .filter(|name| {
-            let output = std::process::Command::new(docker)
-                .args(["inspect", "--format", "{{.Id}}", name.as_str()])
-                .output();
-            !matches!(output, Ok(o) if o.status.success())
-        })
-        .cloned()
-        .collect();
-
-    if missing.is_empty() {
-        tracing::info!("All {} images available locally", names.len());
-        return Ok(());
-    }
-
-    let concurrency = config.images.pull_concurrency;
-    println!(
-        "Pulling {} missing image(s) (concurrency={concurrency})...",
-        missing.len()
+    std::fs::create_dir_all(&config.image_cache.layers_dir)?;
+    tracing::info!(
+        "Layer cache directory: {}",
+        config.image_cache.layers_dir.display()
     );
 
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
-    let mut set = JoinSet::new();
-    for img in missing {
-        let bin = docker.clone();
-        let permit_owner = sem.clone();
-        set.spawn(async move {
-            let _permit = permit_owner.acquire_owned().await;
-            let output = tokio::process::Command::new(&bin)
-                .args(["pull", &img])
-                .output()
-                .await;
-            (img, output)
-        });
-    }
+    println!("Pool initialised successfully!");
+    println!("  Max sandboxes:  {max_sandboxes}");
+    println!("  Seccomp:        enabled");
+    println!("  Config file:    {}", config_file.display());
+    println!("  Overlay dir:    {}", overlay_dir.display());
+    println!(
+        "  Layer cache:    {}",
+        config.image_cache.layers_dir.display()
+    );
+    println!();
+    println!("Registry starts empty. Register images at runtime:");
+    println!("  curl -X POST http://<host>:<port>/api/v1/images \\");
+    println!("    -H 'Content-Type: application/json' \\");
+    println!("    -d '{{\"images\": [\"ubuntu:22.04\"]}}'");
 
-    let mut failed = 0usize;
-    while let Some(res) = set.join_next().await {
-        let (img, output) = res?;
-        match output {
-            Ok(o) if o.status.success() => println!("  pulled {img}"),
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                eprintln!("  FAILED {img}: {}", stderr.trim());
-                failed += 1;
-            }
-            Err(e) => {
-                eprintln!("  FAILED {img}: {e}");
-                failed += 1;
-            }
-        }
-    }
-
-    if failed > 0 {
-        anyhow::bail!("{failed} image pull(s) failed");
-    }
-    println!("All pulls succeeded.");
     Ok(())
 }
 
@@ -272,7 +215,9 @@ pub async fn run_daemon(
     let (config, _) = load_config(config_path)?;
 
     let pool = Pool::new(config).await?;
-    tracing::info!("Pool initialized with {} sandboxes", pool.status().total);
+    tracing::info!(
+        "Pool initialised; registry starts empty (POST /api/v1/images to register)",
+    );
     tracing::info!("Starting daemon API server (bind address: {bind})");
 
     let server_result = server::run_server(bind, pool.clone(), api_token).await;
@@ -288,30 +233,31 @@ pub async fn show_status(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let (config, config_file) = load_config(config_path)?;
 
     println!("=== Sandbox Pool Configuration ===");
-    println!("Config file: {}", config_file.display());
-    println!("Max sandboxes: {}", config.max_sandboxes);
-    println!("Layers dir: {}", config.images.layers_dir.display());
-    println!("Image sources: {}", config.images.sources.len());
-    println!("Overlay dir: {}", config.overlay_dir.display());
+    println!("Config file:    {}", config_file.display());
+    println!("Max sandboxes:  {}", config.max_sandboxes);
+    println!("Layer cache:    {}", config.image_cache.layers_dir.display());
+    println!("Docker bin:     {}", config.image_cache.docker);
+    println!("Pull concurrency: {}", config.image_cache.pull_concurrency);
+    println!("Overlay dir:    {}", config.overlay_dir.display());
     println!("Overlay driver: {:?}", config.overlay_driver);
     println!(
         "Mount host resolv.conf into sandbox: {}",
         config.mount_host_resolv_conf
     );
     println!("Default timeout: {:?}", config.default_timeout);
-    println!("Seccomp: enabled");
+    println!("Seccomp:        enabled");
     println!();
     println!("=== Resource Limits ===");
-    println!("Memory max: {}", config.resource_limits.memory_max);
-    println!("CPU max: {}", config.resource_limits.cpu_max);
-    println!("PIDs max: {}", config.resource_limits.pids_max);
+    println!("Memory max:     {}", config.resource_limits.memory_max);
+    println!("CPU max:        {}", config.resource_limits.cpu_max);
+    println!("PIDs max:       {}", config.resource_limits.pids_max);
     if let Some(ref io_max) = config.resource_limits.io_max {
-        println!("I/O max: {io_max}");
+        println!("I/O max:        {io_max}");
     }
 
     println!();
     println!("=== Seccomp Policy ===");
-    println!("Block network: {}", config.seccomp_policy.block_network);
+    println!("Block network:  {}", config.seccomp_policy.block_network);
     println!(
         "Allow UNIX sockets: {}",
         config.seccomp_policy.allow_unix_sockets
@@ -331,6 +277,7 @@ pub async fn show_status(config_path: Option<PathBuf>) -> anyhow::Result<()> {
 
     println!();
     println!("For live pool status, query the daemon API: GET /api/v1/status");
+    println!("For registered images,                    GET /api/v1/images");
 
     Ok(())
 }

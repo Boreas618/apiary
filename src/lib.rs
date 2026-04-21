@@ -14,14 +14,13 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use apiary::{ImagesConfig, Pool, PoolConfig, SessionOptions, Task};
+//! use apiary::{LayerCacheConfig, Pool, PoolConfig, SessionOptions, Task};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let config = PoolConfig::builder()
 //!         .max_sandboxes(16)
-//!         .images(ImagesConfig {
-//!             sources: vec!["ubuntu:22.04".into()],
+//!         .image_cache(LayerCacheConfig {
 //!             layers_dir: "/tmp/apiary_layers".into(),
 //!             docker: "docker".into(),
 //!             pull_concurrency: 8,
@@ -29,6 +28,9 @@
 //!         .build()?;
 //!
 //!     let pool = Pool::new(config).await?;
+//!
+//!     // Register an image at runtime via the image loader.
+//!     pool.image_loader().load_one("ubuntu:22.04", |_| {}).await;
 //!
 //!     let task = Task::new("echo hello")
 //!         .timeout(std::time::Duration::from_secs(30));
@@ -51,9 +53,12 @@ pub mod sandbox;
 pub mod task;
 
 pub use config::{
-    ImagesConfig, OverlayDriver, PoolConfig, PoolConfigBuilder, ResourceLimits, SeccompPolicy,
+    LayerCacheConfig, OverlayDriver, PoolConfig, PoolConfigBuilder, ResourceLimits, SeccompPolicy,
 };
-pub use images::ImageRegistry;
-pub use pool::{Pool, PoolError, PoolStatus, SessionOptions};
+pub use images::{ImageLoader, ImageRegistry, ImageStage, LoadOutcome};
+pub use pool::{
+    ImageJob, ImageJobState, ImageJobs, ImageProgress, JobAck, JobId, Pool, PoolError, PoolStatus,
+    SessionOptions,
+};
 pub use sandbox::{Sandbox, SandboxError, SandboxState};
 pub use task::{MountSpec, Task, TaskBuilder, TaskResult};
