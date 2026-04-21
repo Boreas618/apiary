@@ -2,13 +2,13 @@ services:
   apiary:
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.dev
     security_opt:
       - seccomp=unconfined
       - apparmor=unconfined
       - label=disable
     ports:
-      - "${APIARY_PORT:-8080}:8080"
+      - "8080:8080"
     cap_add:
       - SYS_ADMIN
       - MKNOD
@@ -18,18 +18,15 @@ services:
     tmpfs:
       - /sys/fs/cgroup:rw,mode=755
     environment:
-      - RUST_BACKTRACE=1
-      - APIARY_BIND=0.0.0.0:8080
-      - APIARY_API_TOKEN
-      - APIARY_LAYERS_DIR=/var/lib/apiary/layers
-      - APIARY_OVERLAY_DIR=/var/lib/apiary/overlays
-      - APIARY_MAX_SANDBOXES=${APIARY_MAX_SANDBOXES:-40}
+      RUST_BACKTRACE: "1"
+      APIARY_OVERLAY_DIR: /var/lib/apiary/overlays
+      CARGO_TARGET_DIR: /var/lib/apiary/target
     volumes:
-      - apiary-layers:/var/lib/apiary/layers
+      - .:/workspace
       - apiary-overlays:/var/lib/apiary/overlays
       - /etc/resolv.conf:/etc/resolv.conf:ro
       - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /workspace
 
 volumes:
-  apiary-layers:
   apiary-overlays:

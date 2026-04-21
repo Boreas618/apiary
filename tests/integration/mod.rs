@@ -8,7 +8,7 @@
 //! Some tests may be skipped if run without proper permissions or on
 //! unsupported systems.
 
-use apiary::{PoolConfig, Task, TaskResult};
+use apiary::{LayerCacheConfig, PoolConfig, Task, TaskResult};
 use std::time::Duration;
 
 #[test]
@@ -36,60 +36,44 @@ fn test_task_builder() {
 #[test]
 fn test_config_builder() {
     let config = PoolConfig::builder()
-        .min_sandboxes(5)
         .max_sandboxes(20)
-        .base_image("/tmp/rootfs")
+        .image_cache(LayerCacheConfig {
+            layers_dir: "/tmp/test_layers".into(),
+            docker: "docker".to_string(),
+            pull_concurrency: 1,
+        })
         .build();
 
     assert!(config.is_ok());
     let config = config.unwrap();
-    assert_eq!(config.min_sandboxes, 5);
     assert_eq!(config.max_sandboxes, 20);
 }
 
 #[test]
-fn test_config_builder_rejects_zero_min_sandboxes() {
-    let result = PoolConfig::builder()
-        .min_sandboxes(0)
-        .base_image("/tmp/rootfs")
-        .build();
-
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_config_builder_rejects_max_less_than_min() {
-    let result = PoolConfig::builder()
-        .min_sandboxes(10)
-        .max_sandboxes(5)
-        .base_image("/tmp/rootfs")
-        .build();
-
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_config_builder_requires_base_image() {
-    let result = PoolConfig::builder().min_sandboxes(5).build();
-
-    assert!(result.is_err());
+fn test_config_builder_works_without_explicit_image_cache() {
+    let result = PoolConfig::builder().build();
+    assert!(result.is_ok(), "image_cache is now optional with sane defaults");
+    let config = result.unwrap();
+    assert_eq!(config.image_cache.docker, "docker");
 }
 
 #[test]
 fn test_config_serialization() {
     let config = PoolConfig::builder()
-        .min_sandboxes(10)
         .max_sandboxes(40)
-        .base_image("/tmp/rootfs")
+        .image_cache(LayerCacheConfig {
+            layers_dir: "/tmp/test_layers".into(),
+            docker: "docker".to_string(),
+            pull_concurrency: 1,
+        })
         .build()
         .unwrap();
 
     let toml_str = toml::to_string(&config).unwrap();
-    assert!(toml_str.contains("min_sandboxes = 10"));
     assert!(toml_str.contains("max_sandboxes = 40"));
+    assert!(toml_str.contains("[image_cache]"));
 
     let parsed: PoolConfig = toml::from_str(&toml_str).unwrap();
-    assert_eq!(parsed.min_sandboxes, config.min_sandboxes);
     assert_eq!(parsed.max_sandboxes, config.max_sandboxes);
 }
 
@@ -139,15 +123,22 @@ mod linux_tests {
     }
 
     #[tokio::test]
-    async fn test_pool_creation_without_base_image() {
+    async fn test_pool_starts_empty() {
+        let tmp = tempfile::tempdir().expect("temp dir");
         let config = PoolConfig::builder()
-            .min_sandboxes(1)
             .max_sandboxes(4)
-            .base_image("/nonexistent/rootfs")
+            .image_cache(LayerCacheConfig {
+                layers_dir: tmp.path().join("layers"),
+                docker: "docker".to_string(),
+                pull_concurrency: 1,
+            })
+            .overlay_dir(tmp.path().join("overlays"))
             .build()
             .unwrap();
 
-        let result = Pool::new(config).await;
-        assert!(result.is_err());
+        let pool = Pool::new(config).await.expect("pool creation should succeed");
+        assert_eq!(pool.status().registered_images, 0);
+        assert!(pool.image_registry().is_empty());
+        pool.shutdown().await;
     }
 }

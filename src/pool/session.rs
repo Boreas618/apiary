@@ -10,34 +10,20 @@ use super::manager::{Pool, PoolError};
 use crate::task::{Task, TaskResult};
 
 /// Options for creating a persistent session.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SessionOptions {
-    /// Default working directory for tasks executed in this session.
-    pub working_dir: Option<PathBuf>,
-    /// Optional per-session base image layers.  When set, a dedicated
-    /// sandbox is created using these layer directories as OverlayFS
-    /// lower dirs instead of the pool's default.  Layers are listed
-    /// bottom-to-top (base first).  The sandbox is destroyed when the
-    /// session is closed (not returned to the pool).
-    pub base_image: Option<Vec<PathBuf>>,
+    /// Working directory for tasks executed in this session (required).
+    pub working_dir: PathBuf,
+    /// Docker image name from the registry (required).
+    pub image: String,
 }
 
 impl SessionOptions {
-    /// Set the session working directory.
-    pub fn working_dir(mut self, path: impl Into<PathBuf>) -> Self {
-        self.working_dir = Some(path.into());
-        self
-    }
-
-    /// Set custom base image layers for this session.
-    ///
-    /// `layers` is an ordered list of layer directories (base first,
-    /// topmost last).  The session gets a dedicated sandbox with these
-    /// layers as OverlayFS lower dirs, which is destroyed (not pooled)
-    /// when the session closes.
-    pub fn base_image(mut self, layers: Vec<PathBuf>) -> Self {
-        self.base_image = Some(layers);
-        self
+    pub fn new(image: impl Into<String>, working_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            working_dir: working_dir.into(),
+            image: image.into(),
+        }
     }
 }
 
@@ -46,9 +32,6 @@ pub(super) struct SessionHandle {
     pub(super) sandbox_id: String,
     pub(super) working_dir: PathBuf,
     pub(super) execution_lock: Arc<AsyncMutex<()>>,
-    /// When true, the sandbox was created with a per-session rootfs and
-    /// must be destroyed (not returned to the idle pool) on session close.
-    pub(super) custom_rootfs: bool,
     /// Per-session execution history (append-only under execution_lock).
     pub(super) history: Arc<Mutex<Vec<ExecutionRecord>>>,
     /// ISO 8601 timestamp of session creation.
@@ -75,30 +58,18 @@ fn resolve_task_working_dir(
 }
 
 impl Pool {
-    /// Create a persistent session bound to a single sandbox.
+    /// Create a persistent session bound to a dedicated sandbox.
     ///
-    /// If no idle sandbox is available the pool scales up automatically (up to
-    /// `max_sandboxes`). Only when the hard cap is reached does the call block
-    /// with a timeout.
+    /// A new sandbox is created for the requested image. Returns
+    /// `PoolError::AtCapacity` when `max_sandboxes` has been reached.
     pub async fn create_session(&self, options: SessionOptions) -> Result<String, PoolError> {
         if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(PoolError::ShuttingDown);
         }
 
-        let (sandbox, custom_rootfs) = if let Some(ref layers) = options.base_image {
-            let sandbox = self.create_sandbox_with_layers(layers).await?;
-            (sandbox, true)
-        } else {
-            let sandbox = self.acquire_sandbox().await?;
-            (sandbox, false)
-        };
+        let sandbox = self.create_sandbox_for_image(&options.image).await?;
 
-        let working_dir = normalize_session_working_dir(
-            options
-                .working_dir
-                .as_deref()
-                .unwrap_or(self.config.default_workdir.as_path()),
-        );
+        let working_dir = normalize_session_working_dir(&options.working_dir);
 
         let session_id = Uuid::new_v4().to_string();
         self.sessions.write().insert(
@@ -107,7 +78,6 @@ impl Pool {
                 sandbox_id: sandbox.id().to_string(),
                 working_dir: working_dir.clone(),
                 execution_lock: Arc::new(AsyncMutex::new(())),
-                custom_rootfs,
                 history: Arc::new(Mutex::new(Vec::new())),
                 created_at: chrono::Utc::now()
                     .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -117,8 +87,8 @@ impl Pool {
         tracing::info!(
             session_id = %session_id,
             sandbox_id = %sandbox.id(),
+            image = %options.image,
             working_dir = %working_dir.display(),
-            custom_rootfs = custom_rootfs,
             "session created"
         );
         Ok(session_id)
@@ -174,7 +144,7 @@ impl Pool {
             .await
             .map_err(PoolError::SandboxError)?;
 
-        if self.config.dump_history {
+        if self.config.session_log_dir.is_some() {
             let mut history = session.history.lock();
             let seq = history.len();
             history.push(record_execution(seq, &task, &result));
@@ -183,7 +153,7 @@ impl Pool {
         Ok(result)
     }
 
-    /// Close a persistent session, reset its sandbox, and return it to the idle pool.
+    /// Close a persistent session and destroy its sandbox.
     pub async fn close_session(&self, session_id: &str) -> Result<(), PoolError> {
         let session = {
             let mut sessions = self.sessions.write();
@@ -192,15 +162,14 @@ impl Pool {
                 .ok_or_else(|| PoolError::SessionNotFound(session_id.to_string()))?
         };
 
-        // Wait for any in-flight session execution to complete before reset.
+        // Wait for any in-flight session execution to complete.
         let _execution_guard = session.execution_lock.lock().await;
 
-        if self.config.dump_history {
+        if let Some(ref log_dir) = self.config.session_log_dir {
             let records: Vec<ExecutionRecord> = session.history.lock().drain(..).collect();
             if !records.is_empty() {
-                let dump_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 match dump_session_history(
-                    &dump_dir,
+                    log_dir,
                     session_id,
                     &session.sandbox_id,
                     &session.working_dir,
@@ -225,59 +194,17 @@ impl Pool {
             }
         }
 
-        let sandbox = {
-            let sandboxes = self.sandboxes.read();
-            sandboxes.get(&session.sandbox_id).cloned().ok_or_else(|| {
-                PoolError::ExecutionFailed(format!(
-                    "session {session_id} is bound to missing sandbox {}",
-                    session.sandbox_id
-                ))
-            })?
-        };
-
-        if session.custom_rootfs {
-            // Custom rootfs sandboxes are destroyed, not returned to pool
-            self.remove_sandbox(&session.sandbox_id);
-            tracing::info!(
-                session_id = %session_id,
-                sandbox_id = %session.sandbox_id,
-                "session closed (custom rootfs sandbox destroyed)"
-            );
-            Ok(())
-        } else {
-            match sandbox.reset().await {
-                Ok(()) => {
-                    self.return_to_idle(&session.sandbox_id);
-                    tracing::info!(
-                        session_id = %session_id,
-                        sandbox_id = %session.sandbox_id,
-                        "session closed"
-                    );
-                    Ok(())
-                }
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        session_id = %session_id,
-                        sandbox_id = %session.sandbox_id,
-                        "session sandbox reset failed; replacing"
-                    );
-                    self.sandboxes.write().remove(&session.sandbox_id);
-                    drop(sandbox);
-
-                    self.replace_sandbox(&session.sandbox_id).await?;
-                    Ok(())
-                }
-            }
-        }
+        self.remove_sandbox(&session.sandbox_id);
+        tracing::info!(
+            session_id = %session_id,
+            sandbox_id = %session.sandbox_id,
+            "session closed (sandbox destroyed)"
+        );
+        Ok(())
     }
 
     /// Run a task in an ephemeral session: create a session, execute the
     /// task, then close the session regardless of outcome.
-    ///
-    /// This is a convenience wrapper around [`create_session`] +
-    /// [`execute_in_session`] + [`close_session`] that handles the
-    /// lifecycle and error priority automatically.
     pub async fn run_task(
         &self,
         task: Task,

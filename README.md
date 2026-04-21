@@ -1,35 +1,38 @@
-# Sandbox Pool
+# Apiary
 
 A lightweight sandbox pool for running AI agent tasks on Linux with namespace isolation.
 
 ## Features
 
-- **Namespace Isolation**: User, Mount, IPC, and UTS namespace isolation for each sandbox
-- **OverlayFS**: Shared read-only base with per-sandbox writable layers (saves 95%+ disk space)
-- **seccomp**: Network syscall filtering for security
-- **cgroups v2**: Resource limits (CPU, memory, PIDs, I/O)
-- **Rootless**: Can run without root privileges (Linux 5.11+)
-- **Pool Management**: Pre-created sandbox pool for fast task execution
-- **Batch Execution**: Run multiple tasks in parallel
-- **Daemon API**: HTTP REST API for task execution
-- **Persistent Sessions**: Pin a sandbox to a session and keep filesystem state across commands
+- **Image-agnostic at startup**: The daemon starts with an empty registry. Clients register Docker images at runtime via HTTP; layers are pulled, extracted, and cached on demand.
+- **Namespace Isolation**: User, Mount, PID, IPC, and UTS namespace isolation for each sandbox.
+- **Docker Image Support**: Use any Docker image as sandbox base; layers are extracted and cached locally in a content-addressable store.
+- **OverlayFS**: Shared read-only base layers with per-sandbox writable layers (saves 95%+ disk space).
+- **seccomp**: Syscall filtering for security (configurable network blocking).
+- **cgroups v2**: Resource limits (CPU, memory, PIDs, I/O) with rlimit fallback.
+- **Rootless**: Runs without root privileges using user namespaces (Linux 5.11+).
+- **On-demand Sandboxes**: Dedicated sandbox per session, created on-demand up to `max_sandboxes`.
+- **Persistent Sessions**: Pin a sandbox to a session and keep filesystem state across commands.
+- **Daemon API**: HTTP REST API with optional Bearer token authentication, including async image-load jobs.
+- **Python Client**: `apiary-client` package with `Apiary` (canonical client) + `ApiarySession` (per-session) + MCP server.
 
 ## Requirements
 
 - Linux kernel 5.11+ (for rootless OverlayFS)
 - cgroups v2 with delegation (for rootless resource limits)
-- `uidmap` package (`newuidmap`/`newgidmap`) for helper-based subordinate ID mappings
-- Rust 1.70+
+- `uidmap` package (`newuidmap`/`newgidmap`) for subordinate ID mappings
+- Docker CLI (for pulling and inspecting images)
+- Rust 1.70+ (build only)
 
 ### Rootless namespace prerequisites
 
-`apiary` always needs `CLONE_NEWUSER` support for non-root execution. If your distribution disables it, enable:
+Apiary needs `CLONE_NEWUSER` support. If your distribution disables it:
 
 ```bash
 sudo sysctl -w kernel.unprivileged_userns_clone=1
 ```
 
-For helper-based expanded ID maps, configure subordinate ranges and ensure setuid helpers exist:
+Configure subordinate ID ranges:
 
 ```bash
 # /etc/subuid
@@ -39,305 +42,410 @@ your-user:100000:65536
 your-user:100000:65536
 ```
 
-### Recommended Distributions
-
-- Ubuntu 22.04+
-- Fedora 36+
-- Debian 12+
-
 ## Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/Boreas618/apiary.git
 cd apiary
-
-# Build
 cargo build --release
-
-# Install (optional)
-cargo install --path .
 ```
 
-## Docker (Recommended)
+## Docker
 
-This repository includes a `Dockerfile` and `docker-compose.yml` at the project root.
+All Dockerfiles live in `docker/`:
+
+| File | Purpose |
+|------|---------|
+| `docker/Dockerfile` | Production image (multi-stage build, minimal runtime) |
+| `docker/Dockerfile.dev` | Development container (full Rust toolchain, source bind-mounted) |
+
+### Production deployment
 
 ```bash
-# Build and start the development container
-docker compose run --rm apiary bash
-
-# Or build and run manually
-docker compose build
-docker compose run --rm apiary cargo build
+docker compose up -d
 ```
 
-The Docker setup is preconfigured for sandbox features:
+The container starts an apiary daemon with an empty image registry on port 8080. Clients register images at runtime via the HTTP API (see "Loading images at runtime" below).
 
-- Installs `uidmap` (`newuidmap`/`newgidmap`) and `fuse-overlayfs`
-- Sets subordinate ID ranges in `/etc/subuid` and `/etc/subgid` for root
-- Starts the container with security options needed for `unshare` (`SYS_ADMIN`, `seccomp=unconfined`)
-- Entrypoint automatically sets up cgroups v2 delegation (controller enablement and subtree creation)
-- The container runs as root; `apiary` then enters its own user namespace for rootless sandbox operation
-- Run `verify-sandbox.sh` inside the container for a quick health check
+Environment variables (override on the `docker compose` command line or in `.env`):
 
-## Quick Start
+| Variable | Default | Purpose |
+|---|---|---|
+| `APIARY_PORT` | `8080` | Host port to publish |
+| `APIARY_BIND` | `0.0.0.0:8080` | Bind address inside the container |
+| `APIARY_API_TOKEN` | (empty) | Bearer token for API auth (empty disables auth) |
+| `APIARY_MAX_SANDBOXES` | `40` | Pool concurrency cap |
+| `APIARY_LAYERS_DIR` | `/var/lib/apiary/layers` | Layer cache (mounted as a named volume) |
+| `APIARY_OVERLAY_DIR` | `/var/lib/apiary/overlays` | Overlay scratch (mounted as a named volume) |
 
-### 1. Create a Base Rootfs
+### Development
 
 ```bash
-# Using Docker (easiest)
-mkdir -p rootfs
-CID=$(sudo docker create ubuntu:jammy) \
-  && sudo docker export "$CID" | tar -xf - --exclude='dev/*' -C rootfs \
-  && sudo docker rm "$CID" > /dev/null
+# Build and enter the dev container (source is bind-mounted)
+docker compose -f docker-compose.dev.yml up -d
+docker compose -f docker-compose.dev.yml exec apiary bash
 
-# Or using debootstrap (Ubuntu/Debian, requires native Linux filesystem)
-sudo debootstrap --variant=minbase jammy ./rootfs
+# Inside the container: build and run
+cargo build --release
+apiary init
+apiary daemon --bind 0.0.0.0:8080
 ```
 
-### 2. Initialize the Pool
+The dev container is preconfigured with all sandbox prerequisites:
+
+- `uidmap`, `fuse-overlayfs`, subordinate ID ranges
+- Full Docker engine (docker-in-docker via socket mount)
+- cgroups v2 delegation (set up by `entrypoint.sh`)
+- `SYS_ADMIN` capability, `seccomp=unconfined`
+- Run `verify-sandbox.sh` inside the container for a health check
+
+## Loading images at runtime
+
+The daemon never pre-loads any image. Clients populate the registry over HTTP and then create sessions against the loaded images.
+
+### Quick example with `curl`
 
 ```bash
-apiary init --base-image ./rootfs --min-sandboxes 10 --max-sandboxes 40
-```
-
-### 3. Run Tasks
-
-```bash
-# Single task
-apiary run --command "echo hello world"
-
-# Batch tasks from JSON file
-apiary batch --tasks tasks.json --parallelism 5
-```
-
-## Usage
-
-### CLI
-
-```bash
-# Initialize pool
-apiary init --base-image ./rootfs --min-sandboxes 10 --max-sandboxes 40
-
-# Run daemon (for API access)
-apiary daemon --bind 127.0.0.1:8080
-
-# Execute single command
-apiary run --command "python script.py" --timeout 60
-
-# Execute batch tasks
-apiary batch --tasks ./tasks.json --parallelism 10
-
-# Show status
-apiary status
-
-# Cleanup
-apiary clean --force
-```
-
-`apiary run` and `apiary batch` now run in session-only mode internally:
-they create session(s), execute command(s), then close session(s) to release sandboxes.
-
-### Daemon HTTP API
-
-When running `apiary daemon`, the server exposes:
-
-- `GET /healthz` - liveness probe
-- `GET /api/v1/status` - pool status and counters (includes `reserved` session sandboxes)
-- `POST /api/v1/sessions` - create a persistent session (reserves one sandbox; accepts optional `working_dir`)
-- `DELETE /api/v1/sessions/:session_id` - close session, reset sandbox, and release it
-- `POST /api/v1/tasks` - execute a task in a session and return JSON result (`session_id` required)
-
-Working directory resolution order is:
-
-1. Task `working_dir`, when provided
-2. Session `working_dir`, when provided at session creation time
-3. Config `default_workdir`
-
-If a task `working_dir` is relative, it is resolved against the session `working_dir`.
-
-Example JSON task request (`session_id` is required, `working_dir` is an optional task-level override):
-
-```json
-{
-  "command": "bash -lc 'echo start && sleep 1 && echo done'",
-  "timeout_ms": 30000,
-  "working_dir": "/workspace",
-  "session_id": "required-session-id",
-  "env": {
-    "MY_VAR": "hello"
-  }
-}
-```
-
-Execute and wait for final JSON result:
-
-```bash
-# Create or reuse a session first
-SESSION_ID=$(curl -sS -X POST "http://127.0.0.1:8080/api/v1/sessions" | jq -r '.session_id')
-
-curl -sS \
-  -X POST "http://127.0.0.1:8080/api/v1/tasks" \
+# 1. Submit an image-load job (returns a job_id)
+JOB_ID=$(curl -sS -X POST http://127.0.0.1:8080/api/v1/images \
   -H "Content-Type: application/json" \
-  -d "{\"command\":\"echo hello from api\",\"session_id\":\"${SESSION_ID}\"}"
-```
+  -d '{"images":["ubuntu:22.04","python:3.12-slim"]}' | jq -r '.job_id')
 
-Create and use a persistent session (filesystem changes survive between commands):
+# 2. Poll until the job is terminal
+while true; do
+  STATE=$(curl -sS "http://127.0.0.1:8080/api/v1/images/jobs/${JOB_ID}" | jq -r '.state')
+  echo "state=$STATE"
+  [[ "$STATE" == "running" ]] || break
+  sleep 2
+done
 
-```bash
-# 1) Create session with a session-level working directory
-SESSION_ID=$(curl -sS \
-  -X POST "http://127.0.0.1:8080/api/v1/sessions" \
+# 3. Create a session against one of the loaded images
+SESSION_ID=$(curl -sS -X POST http://127.0.0.1:8080/api/v1/sessions \
   -H "Content-Type: application/json" \
-  -d '{"working_dir":"/workspace"}' | jq -r '.session_id')
+  -d '{"image":"ubuntu:22.04","working_dir":"/workspace"}' | jq -r '.session_id')
 
-# 2) First command writes a file
-curl -sS \
-  -X POST "http://127.0.0.1:8080/api/v1/tasks" \
+# 4. Execute a command
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/sessions/${SESSION_ID}/exec" \
   -H "Content-Type: application/json" \
-  -d "{\"command\":\"bash -lc 'echo hello > /workspace/marker.txt'\",\"session_id\":\"${SESSION_ID}\"}"
+  -d '{"command":"echo hello from apiary"}'
 
-# 3) Second command in same session can still read it
-curl -sS \
-  -X POST "http://127.0.0.1:8080/api/v1/tasks" \
-  -H "Content-Type: application/json" \
-  -d "{\"command\":\"cat /workspace/marker.txt\",\"session_id\":\"${SESSION_ID}\"}"
-
-# 4) Close session and release sandbox back to pool
+# 5. Close session
 curl -sS -X DELETE "http://127.0.0.1:8080/api/v1/sessions/${SESSION_ID}"
 ```
 
-### Library API
+### Quick example with the Python client
 
-The library is session-only: create a session before execution, and close it when done.
-Task `working_dir` overrides the session `working_dir`; otherwise the session default is used.
+```python
+import asyncio
+from apiary_client import AsyncApiary
+
+async def main():
+    async with AsyncApiary(
+        apiary_url="http://127.0.0.1:8080",
+        images=["ubuntu:22.04", "python:3.12-slim"],
+    ) as apiary:
+        async with apiary.session(image="ubuntu:22.04") as s:
+            result = await s.execute("echo hello from apiary")
+            print(result.stdout)
+
+asyncio.run(main())
+```
+
+See "Python Client" below for the full surface.
+
+## CLI Reference
+
+```
+apiary [OPTIONS] <COMMAND>
+
+Commands:
+  init     Write a config file and prepare directories (no images required)
+  daemon   Start the HTTP API server
+  status   Show pool configuration
+  clean    Remove sandbox data and config
+
+Options:
+  -c, --config <PATH>   Config file path (default: ~/.config/apiary/config.toml)
+  -v, --verbose         Increase log verbosity (-v = debug, -vv = trace)
+```
+
+### `apiary init`
+
+```
+Options:
+  --layers-dir <DIR>    Layer cache directory [default: /tmp/apiary_layers]
+  --max-sandboxes <N>   Hard ceiling for concurrent sessions [default: 40]
+  --overlay-dir <DIR>   Directory for per-sandbox overlay layers
+```
+
+`init` no longer takes an `--image` flag. The pool starts empty; images are added at runtime via the HTTP API.
+
+### `apiary daemon`
+
+```
+Options:
+  --bind <ADDR>         Listen address [default: 127.0.0.1:8080]
+  --api-token <TOKEN>   Bearer token for API auth (also reads APIARY_API_TOKEN env)
+```
+
+## Daemon HTTP API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET`    | `/healthz` | Liveness probe |
+| `GET`    | `/api/v1/status` | Pool status, counters, registered image count |
+| `POST`   | `/api/v1/sessions` | Create a session (404 if image not registered) |
+| `DELETE` | `/api/v1/sessions/{session_id}` | Close session, cleanup sandbox |
+| `POST`   | `/api/v1/sessions/{session_id}/exec` | Execute a command in the session |
+| `GET`    | `/api/v1/images` | List registered image names |
+| `POST`   | `/api/v1/images` | Submit an async image-load job (returns 202 + job_id) |
+| `DELETE` | `/api/v1/images/{name}` | Drop an image from the registry |
+| `GET`    | `/api/v1/images/jobs/{job_id}` | Poll image-load job status |
+
+### Register Images (async)
+
+```json
+POST /api/v1/images
+{
+  "images": ["ubuntu:22.04", "docker.io/library/python:3.12-slim"]
+}
+
+→ 202
+{
+  "job_id": "9e4f...",
+  "queued": ["docker.io/library/python:3.12-slim"],
+  "already_present": ["ubuntu:22.04"]
+}
+```
+
+### Poll Image Job
+
+```json
+GET /api/v1/images/jobs/9e4f...
+{
+  "job_id": "9e4f...",
+  "state": "running",          // "running" | "done" | "failed"
+  "started_at": "...",
+  "updated_at": "...",
+  "per_image": {
+    "ubuntu:22.04":               { "state": "alreadypresent" },
+    "docker.io/.../python:3.12":  { "state": "extracting", "layers_done": 7, "layers_total": 12 }
+  },
+  "failed_images": []
+}
+```
+
+A job ends in `done` if at least one image succeeded, `failed` only when every image failed. Per-image failures appear in both `per_image[name].state == "failed"` and the top-level `failed_images` list.
+
+### Create Session
+
+```json
+{
+  "image": "ubuntu:22.04",
+  "working_dir": "/workspace"
+}
+```
+
+Both `image` and `working_dir` are required. Returns **404** if the image isn't registered yet — load it first via `POST /api/v1/images`.
+
+### Execute Command
+
+```json
+{
+  "command": "bash -lc 'echo hello'",
+  "timeout_ms": 30000,
+  "working_dir": "/workspace/subdir",
+  "env": { "MY_VAR": "hello" }
+}
+```
+
+- `command` is required; all other fields are optional.
+- `timeout_ms` defaults to the pool's `default_timeout` (300s).
+- `working_dir` overrides the session default. Relative paths resolve against the session `working_dir`.
+- `env` is merged with the pool's `default_env` (task values win on conflict).
+
+### Session Persistence
+
+Filesystem changes persist within a session:
+
+```bash
+# Write a file
+curl -sS -X POST ".../exec" -d '{"command":"echo data > /workspace/file.txt"}'
+
+# Read it back in the same session
+curl -sS -X POST ".../exec" -d '{"command":"cat /workspace/file.txt"}'
+# → "data"
+```
+
+Closing and recreating a session starts fresh.
+
+## Configuration
+
+Generated by `apiary init` at `~/.config/apiary/config.toml`:
+
+```toml
+max_sandboxes = 40
+overlay_dir = "/home/user/.local/share/apiary/overlays"
+default_timeout = "300s"
+mount_host_resolv_conf = true
+
+[image_cache]
+layers_dir = "/tmp/apiary_layers"
+docker = "docker"
+pull_concurrency = 8
+
+[resource_limits]
+memory_max = "4G"
+cpu_max = "100000 100000"
+pids_max = 2048
+max_open_files = 2048
+# max_file_size = "1G"
+# io_max = "8:0 rbps=52428800 wbps=41943040"
+
+[seccomp_policy]
+block_network = false
+allow_unix_sockets = true
+# blocked_syscalls = ["ptrace"]
+# allowed_syscalls = []
+```
+
+The `[image_cache]` section configures the layer cache; it does **not** enumerate which images the pool serves. Images are registered at runtime.
+
+## Library API
 
 ```rust
-use apiary::{Pool, PoolConfig, SessionOptions, Task};
-use std::time::Duration;
+use apiary::{LayerCacheConfig, Pool, PoolConfig, SessionOptions, Task};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Create configuration
     let config = PoolConfig::builder()
-        .min_sandboxes(10)
-        .max_sandboxes(10)
-        .base_image("./rootfs")
+        .max_sandboxes(16)
+        .image_cache(LayerCacheConfig {
+            layers_dir: "/tmp/apiary_layers".into(),
+            docker: "docker".into(),
+            pull_concurrency: 8,
+        })
         .build()?;
 
-    // Initialize pool
     let pool = Pool::new(config).await?;
 
-    // Create and execute a task
-    let task = Task::new("echo hello")
-        .timeout(Duration::from_secs(30))
-        .env("MY_VAR", "value");
+    // Register an image at runtime via the loader.
+    pool.image_loader()
+        .load_one("ubuntu:22.04", |_stage| {})
+        .await;
 
     let session_id = pool
-        .create_session(SessionOptions::default().working_dir("/workspace"))
+        .create_session(SessionOptions::new("ubuntu:22.04", "/workspace"))
         .await?;
+
+    let task = Task::new("echo hello")
+        .timeout(std::time::Duration::from_secs(30));
     let result = pool.execute_in_session(&session_id, task).await?;
-    println!("Exit code: {}", result.exit_code);
-    println!("Output: {}", result.stdout_lossy());
+
+    println!("exit_code={} stdout={}", result.exit_code, result.stdout_lossy());
 
     pool.close_session(&session_id).await?;
-
     pool.shutdown().await;
     Ok(())
 }
 ```
 
-## Configuration
+## Python Client
 
-Configuration is stored in `~/.config/apiary/config.toml`:
+Install from the `bindings/python/` directory:
 
-```toml
-min_sandboxes = 10
-max_sandboxes = 40
-scale_up_step = 2
-idle_timeout = "300s"
-cooldown = "30s"
-base_image = "./rootfs"
-overlay_dir = "~/.local/share/apiary/overlays"
-default_timeout = "300s"
-default_workdir = "/workspace"
-
-[resource_limits]
-memory_max = "2G"
-cpu_max = "100000 100000"
-pids_max = 256
-
-[seccomp_policy]
-block_network = true
-allow_unix_sockets = true
+```bash
+pip install ./bindings/python            # base client
+pip install ./bindings/python[swebench]  # + SWE-bench image resolution helpers
+pip install ./bindings/python[mcp]       # + MCP server
 ```
 
-## Tasks JSON Format
+### Class layout
 
-The batch tasks file uses the `Task` struct directly. Note that `timeout` is in
-**milliseconds** (the HTTP API also accepts `timeout_ms`).
+| Class | Role |
+|---|---|
+| `Apiary` / `AsyncApiary` | **Canonical client.** Image-set management + pool admin + session factory. |
+| `ApiarySession` / `AsyncApiarySession` | Per-session client. Returned by `apiary.session(image=...)`; can also be constructed directly. |
+| `ApiarySessionMux` | Multi-client session multiplexer (used by the MCP server). |
 
-```json
-[
-  {
-    "id": "task-1",
-    "command": ["python3", "-c", "print('hello')"],
-    "env": {"PYTHONPATH": "/app"},
-    "working_dir": "/workspace",
-    "timeout": 60000
-  },
-  {
-    "id": "task-2", 
-    "command": ["bash", "-c", "echo $MY_VAR"],
-    "env": {"MY_VAR": "world"},
-    "timeout": 30000
-  }
-]
+### Usage
+
+```python
+from apiary_client import AsyncApiary
+
+# Batch driver: load image set, run jobs against it, exit.
+async with AsyncApiary(
+    apiary_url="http://127.0.0.1:8080",
+    apiary_token=token,             # optional Bearer
+    images=["ubuntu:22.04", "python:3.12-slim"],
+) as apiary:
+    async with apiary.session(image="ubuntu:22.04") as s:   # AsyncApiarySession
+        result = await s.execute("echo hello")
+        print(result.stdout)
+
+# Pure admin: no image set, just inspect/modify the pool.
+async with AsyncApiary(apiary_url="http://127.0.0.1:8080") as apiary:
+    print(await apiary.all_images())
+    await apiary.delete_image("stale:tag")
 ```
 
-If `working_dir` is omitted, the task inherits the session `working_dir`. Relative
-task paths are resolved against the session `working_dir`.
+### SWE-bench Image Resolution
+
+```bash
+# Resolve a SWE-bench dataset and load the images into a running daemon
+apiary-load-swebench --apiary-url http://127.0.0.1:8080 --dataset lite
+
+# Pure resolution, no daemon needed
+python -m apiary_client.swebench.load --dataset verified --print-only
+```
+
+### MCP Server
+
+```bash
+apiary-mcp --apiary-url http://127.0.0.1:8080 --image ubuntu:22.04
+```
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      Sandbox Pool                           │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │ Pool Manager │  │ Task Queue   │  │ Config       │      │
-│  └──────────────┘  └──────────────┘  └──────────────┘      │
-└─────────────────────────────────────────────────────────────┘
-                              │
-          ┌───────────────────┼───────────────────┐
-          ▼                   ▼                   ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│  Sandbox #1     │  │  Sandbox #2     │  │  Sandbox #N     │
-├─────────────────┤  ├─────────────────┤  ├─────────────────┤
-│ User NS         │  │ User NS         │  │ User NS         │
-│ Mount NS        │  │ Mount NS        │  │ Mount NS        │
-│ PID NS          │  │ PID NS          │  │ PID NS          │
-│ OverlayFS       │  │ OverlayFS       │  │ OverlayFS       │
-│ seccomp         │  │ seccomp         │  │ seccomp         │
-│ cgroup          │  │ cgroup          │  │ cgroup          │
-└─────────────────┘  └─────────────────┘  └─────────────────┘
+│                      Daemon (HTTP API)                       │
+│  axum router: /healthz, /api/v1/{status, sessions, images}   │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│                        Pool Manager                          │
+│  ┌────────┐ ┌────────┐ ┌─────────┐ ┌────────┐ ┌──────────┐ │
+│  │Sessions│ │Sandbox │ │Image    │ │Image   │ │Image     │ │
+│  │Map     │ │Map     │ │Registry │ │Loader  │ │Jobs      │ │
+│  │        │ │        │ │(mut)    │ │(dedupe)│ │(tracker) │ │
+│  └────────┘ └────────┘ └─────────┘ └────────┘ └──────────┘ │
+└───────────────────────────┬─────────────────────────────────┘
+                            │ on-demand creation
+          ┌─────────────────┼─────────────────┐
+          ▼                 ▼                 ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│  Sandbox #0     │ │  Sandbox #1     │ │  Sandbox #N     │
+├─────────────────┤ ├─────────────────┤ ├─────────────────┤
+│ User NS         │ │ User NS         │ │ User NS         │
+│ Mount NS (ovl)  │ │ Mount NS (ovl)  │ │ Mount NS (ovl)  │
+│ PID NS          │ │ PID NS          │ │ PID NS          │
+│ seccomp filter  │ │ seccomp filter  │ │ seccomp filter  │
+│ cgroup / rlimit │ │ cgroup / rlimit │ │ cgroup / rlimit │
+└─────────────────┘ └─────────────────┘ └─────────────────┘
 ```
 
 ## Security
 
-The sandbox provides multiple layers of isolation:
+Each sandbox provides multiple layers of isolation:
 
-1. **User Namespace**: Maps root inside sandbox to unprivileged user outside
-2. **Mount Namespace**: Isolated filesystem view with OverlayFS
-3. **IPC Namespace**: Isolated System V IPC and POSIX message queues
-4. **UTS Namespace**: Isolated hostname
-5. **seccomp**: Blocks network syscalls and other dangerous operations
-6. **cgroups**: Limits CPU, memory, and other resources
-
-### Protected Paths
-
-- `/proc`, `/sys`: Mounted with appropriate restrictions
-- Network: Blocked by seccomp syscall filtering (note: this is not network namespace isolation; if seccomp cannot be applied, Apiary emits a warning and continues)
+1. **User Namespace**: Maps root inside sandbox to unprivileged user outside.
+2. **Mount Namespace**: Isolated filesystem view via OverlayFS (shared read-only base layers + per-sandbox writable upper).
+3. **PID Namespace**: Isolated process tree.
+4. **IPC Namespace**: Isolated System V IPC and POSIX message queues.
+5. **UTS Namespace**: Isolated hostname.
+6. **seccomp**: Configurable syscall filtering (network blocking, custom allow/block lists).
+7. **cgroups v2**: CPU, memory, PIDs, and I/O limits (with rlimit fallback when cgroups are unavailable).
 
 ## License
 

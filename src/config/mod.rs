@@ -4,7 +4,7 @@ mod overlay;
 mod schema;
 
 pub use overlay::OverlayDriver;
-pub use schema::{PoolConfig, PoolConfigBuilder, ResourceLimits, SeccompPolicy};
+pub use schema::{LayerCacheConfig, PoolConfig, PoolConfigBuilder, ResourceLimits, SeccompPolicy};
 
 use std::path::Path;
 

@@ -1,0 +1,28 @@
+target/
+.git/
+.github/
+.gitignore
+.dockerignore
+
+# Build artefacts
+*.swp
+*.swo
+*~
+
+# Documentation (not needed in images)
+docs/
+*.md
+LICENSE
+
+# Tests
+tests/
+
+# IDE / editor
+.vscode/
+.cursor/
+.idea/
+
+# Python caches (bindings/python/ is COPY'd for swebench image)
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/

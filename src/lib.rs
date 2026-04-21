@@ -9,28 +9,34 @@
 //! - **seccomp**: Network syscall filtering for security
 //! - **cgroups v2**: Resource limits (CPU, memory, PIDs, I/O)
 //! - **Rootless**: Can run without root privileges (Linux 5.11+)
-//! - **Pool Management**: Pre-created sandbox pool for fast task execution
+//! - **On-demand Sandboxes**: Dedicated sandbox per session, created on-demand
 //!
 //! ## Example
 //!
 //! ```rust,no_run
-//! use apiary::{Pool, PoolConfig, SessionOptions, Task};
+//! use apiary::{LayerCacheConfig, Pool, PoolConfig, SessionOptions, Task};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let config = PoolConfig::builder()
-//!         .min_sandboxes(4)
 //!         .max_sandboxes(16)
-//!         .base_image("./rootfs")
+//!         .image_cache(LayerCacheConfig {
+//!             layers_dir: "/tmp/apiary_layers".into(),
+//!             docker: "docker".into(),
+//!             pull_concurrency: 8,
+//!         })
 //!         .build()?;
 //!
 //!     let pool = Pool::new(config).await?;
+//!
+//!     // Register an image at runtime via the image loader.
+//!     pool.image_loader().load_one("ubuntu:22.04", |_| {}).await;
 //!
 //!     let task = Task::new("echo hello")
 //!         .timeout(std::time::Duration::from_secs(30));
 //!
 //!     let session_id = pool
-//!         .create_session(SessionOptions::default().working_dir("/workspace"))
+//!         .create_session(SessionOptions::new("ubuntu:22.04", "/workspace"))
 //!         .await?;
 //!     let result = pool.execute_in_session(&session_id, task).await?;
 //!     println!("Exit code: {}", result.exit_code);
@@ -41,11 +47,18 @@
 //! ```
 
 pub mod config;
+pub mod images;
 pub mod pool;
 pub mod sandbox;
 pub mod task;
 
-pub use config::{OverlayDriver, PoolConfig, PoolConfigBuilder, ResourceLimits, SeccompPolicy};
-pub use pool::{Pool, PoolError, PoolStatus, SessionOptions};
+pub use config::{
+    LayerCacheConfig, OverlayDriver, PoolConfig, PoolConfigBuilder, ResourceLimits, SeccompPolicy,
+};
+pub use images::{ImageLoader, ImageRegistry, ImageStage, LoadOutcome};
+pub use pool::{
+    ImageJob, ImageJobState, ImageJobs, ImageProgress, JobAck, JobId, Pool, PoolError, PoolStatus,
+    SessionOptions,
+};
 pub use sandbox::{Sandbox, SandboxError, SandboxState};
 pub use task::{MountSpec, Task, TaskBuilder, TaskResult};
